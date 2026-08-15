@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs
 import webbrowser
 
@@ -41,7 +43,7 @@ from .qt_compat import (
 )
 
 from .config import APP_NAME, get_app_paths
-from .library_store import FolderRecord, LibraryStore
+from .library_store import FolderRecord, LibraryStore, TrackRecord
 from .map_service import LeafletMapService, MapService
 from .settings_store import (
     get_map_default_track_color,
@@ -70,6 +72,13 @@ TRACK_IDS_MIME = "application/x-gpx-track-ids"
 FOLDER_ID_ROLE = Qt.ItemDataRole.UserRole
 FOLDER_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 TRACK_ID_ROLE = Qt.ItemDataRole.UserRole
+
+
+@dataclass
+class _EditCommand:
+    label: str
+    undo: Callable[[], None]
+    redo: Callable[[], None]
 
 
 class FolderTreeWidget(QTreeWidget):
@@ -397,8 +406,25 @@ class MainWindow(QMainWindow):
         self._map_hide_timer = QTimer(self)
         self._map_hide_timer.setSingleShot(True)
         self._map_hide_timer.timeout.connect(self._hide_map_toolbar)
+        self._preview_update_timer = QTimer(self)
+        self._preview_update_timer.setSingleShot(True)
+        self._preview_update_timer.timeout.connect(self._preview_selected_track)
         self._import_action = None
-        self.setWindowTitle(f"{APP_NAME} - Milestone 3 Organizer")
+        self._undo_action = None
+        self._redo_action = None
+        self._undo_stack: list[_EditCommand] = []
+        self._redo_stack: list[_EditCommand] = []
+        self._visible_tracks: list[TrackRecord] = []
+        self._map_overlay_state: dict[str, bool] = {
+            "gradient": True,
+            "points": False,
+            "endpoints": True,
+            "distance": True,
+            "directionArrows": True,
+            "rests": True,
+            "bicycleRoutes": False,
+        }
+        self.setWindowTitle(f"{APP_NAME} - Milestone 6 Organizer")
         self.resize(1400, 840)
         self.setAcceptDrops(True)
         self._init_menu()
@@ -417,7 +443,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._import_action = file_menu.addAction("Import GPX")
         self._import_action.triggered.connect(self._import_gpx_into_selected_folder)
-        file_menu.addAction("Export GPX")
+        export_action = file_menu.addAction("Export GPX")
+        export_action.triggered.connect(self._export_selected_track)
         file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
@@ -428,15 +455,18 @@ class MainWindow(QMainWindow):
         delete_action = edit_menu.addAction("Delete")
         delete_action.triggered.connect(self._delete_selected_item)
         edit_menu.addSeparator()
-        edit_menu.addAction("Undo")
-        edit_menu.addAction("Redo")
+        self._undo_action = edit_menu.addAction("Undo")
+        self._undo_action.triggered.connect(self._undo_last_edit)
+        self._redo_action = edit_menu.addAction("Redo")
+        self._redo_action.triggered.connect(self._redo_last_edit)
 
         track_menu = menu_bar.addMenu("Track")
         trim_action = track_menu.addAction("Trim")
         trim_action.triggered.connect(self._trim_selected_track)
         split_action = track_menu.addAction("Split")
         split_action.triggered.connect(self._split_selected_track)
-        track_menu.addAction("Merge")
+        merge_action = track_menu.addAction("Merge")
+        merge_action.triggered.connect(self._merge_selected_tracks)
         reverse_action = track_menu.addAction("Reverse")
         reverse_action.triggered.connect(self._reverse_selected_tracks)
 
@@ -452,6 +482,7 @@ class MainWindow(QMainWindow):
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self._show_about)
+        self._update_undo_redo_actions()
 
     def _init_body(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -510,7 +541,7 @@ class MainWindow(QMainWindow):
         track_list.setAlternatingRowColors(True)
         track_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         track_list.customContextMenuRequested.connect(self._show_track_context_menu)
-        track_list.itemSelectionChanged.connect(self._preview_selected_track)
+        track_list.itemSelectionChanged.connect(self._schedule_preview_update)
         track_list.itemDoubleClicked.connect(self._open_track_preview)
         self.track_list = track_list
 
@@ -533,10 +564,7 @@ class MainWindow(QMainWindow):
             web_view.installEventFilter(self)
             web_view.urlChanged.connect(self._handle_map_web_url_changed)
             self.map_web_view = web_view
-            self._set_map_placeholder(
-                title="Map Placeholder",
-                message="Double-click a track to preview it on the map.",
-            )
+            self._show_select_track_placeholder()
             layout.addWidget(web_view, 0, 0)
         else:
             fallback = QLabel(
@@ -705,13 +733,20 @@ class MainWindow(QMainWindow):
             return
 
         folder_id = self._selected_folder_id()
-        tracks = self.library_store.list_tracks(folder_id)
+        tracks = self.library_store.list_tracks_recursive(folder_id)
+        self._visible_tracks = tracks
 
+        self.track_list.blockSignals(True)
         self.track_list.clear()
         if not tracks:
             placeholder = QListWidgetItem("No tracks in this folder")
             placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.track_list.addItem(placeholder)
+            self.track_list.blockSignals(False)
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="No tracks in this folder view.",
+            )
             return
 
         for track in tracks:
@@ -720,6 +755,13 @@ class MainWindow(QMainWindow):
             self.track_list.addItem(item)
             if selected_track_id is not None and track.id == selected_track_id:
                 self.track_list.setCurrentItem(item)
+
+        self.track_list.blockSignals(False)
+        self._schedule_preview_update()
+
+    def _schedule_preview_update(self) -> None:
+        # Coalesce rapid selection changes into one render to keep UI responsive.
+        self._preview_update_timer.start(90)
 
     def _import_file_paths(self, file_paths: list[Path], folder_id: int) -> tuple[int, int, list[str]]:
         imported_count = 0
@@ -732,10 +774,9 @@ class MainWindow(QMainWindow):
                 continue
 
             try:
-                result = self.library_store.import_gpx(path, folder_id)
-                imported_count += 1
-                if result.is_duplicate:
-                    duplicate_count += 1
+                results = self.library_store.import_gpx_all(path, folder_id)
+                imported_count += len(results)
+                duplicate_count += sum(1 for result in results if result.is_duplicate)
             except Exception as exc:  # pragma: no cover - GUI pathway
                 failures.append(f"{path}: {exc}")
 
@@ -779,6 +820,50 @@ class MainWindow(QMainWindow):
         )
         if failures:
             QMessageBox.warning(self, "Dropped import errors", "\n".join(failures[:10]))
+
+    def _export_selected_track(self) -> None:
+        track_ids = self._selected_track_ids()
+        if len(track_ids) != 1:
+            QMessageBox.information(self, "Export GPX", "Please select exactly one track.")
+            return
+
+        track = self.library_store.get_track(track_ids[0])
+        default_target = str(Path.home() / track.display_name)
+        selected_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export GPX",
+            default_target,
+            "GPX Files (*.gpx)",
+        )
+        if not selected_path:
+            return
+
+        destination = Path(selected_path)
+        if destination.suffix.lower() != ".gpx":
+            destination = destination.with_suffix(".gpx")
+
+        overwrite = False
+        if destination.exists():
+            reply = QMessageBox.question(
+                self,
+                "Export GPX",
+                f"{destination.name} already exists. Overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            overwrite = True
+
+        try:
+            exported_path = self.library_store.export_track(
+                track_id=track.id,
+                destination_path=destination,
+                overwrite=overwrite,
+            )
+            self.statusBar().showMessage(f"Exported GPX to {exported_path}", 6000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export GPX failed", str(exc))
 
     def _new_library_dialog(self) -> None:
         base_dir = QFileDialog.getExistingDirectory(
@@ -905,6 +990,12 @@ class MainWindow(QMainWindow):
         split_action = menu.addAction("Split")
         split_action.triggered.connect(self._split_selected_track)
 
+        merge_action = menu.addAction("Merge")
+        merge_action.triggered.connect(self._merge_selected_tracks)
+
+        export_action = menu.addAction("Export GPX")
+        export_action.triggered.connect(self._export_selected_track)
+
         set_color_action = menu.addAction("Set color")
         set_color_action.triggered.connect(self._set_selected_track_color)
 
@@ -918,41 +1009,168 @@ class MainWindow(QMainWindow):
             reverse_action.setEnabled(False)
             trim_action.setEnabled(False)
             split_action.setEnabled(False)
+            merge_action.setEnabled(False)
+            export_action.setEnabled(False)
             set_color_action.setEnabled(False)
             delete_action.setEnabled(False)
+        elif len(self._selected_track_ids()) < 2:
+            merge_action.setEnabled(False)
 
         menu.exec(self.track_list.viewport().mapToGlobal(pos))
 
     def _open_track_preview(self, item: QListWidgetItem) -> None:
         track_id = item.data(TRACK_ID_ROLE)
         if track_id is None:
+            self._show_select_track_placeholder()
             return
 
         track_name = item.text()
         try:
             managed_path = self.library_store.get_track_managed_path(int(track_id))
-            rendered = self.map_service.render_track(managed_path, track_name)
+            if isinstance(self.map_service, LeafletMapService):
+                rendered = self.map_service.render_track(
+                    managed_path,
+                    track_name,
+                    initial_overlays=self._map_overlay_state,
+                )
+            else:
+                rendered = self.map_service.render_track(managed_path, track_name)
             self._set_map_html(rendered.html)
             self.statusBar().showMessage(f"Loaded map preview for {track_name}", 5000)
         except Exception as exc:
-            self._set_map_placeholder(
-                title="Map preview failed",
-                message=str(exc),
-            )
+            # Treat a stale selection (deleted track) as a normal empty-preview state.
+            if isinstance(exc, ValueError) and "Track id" in str(exc) and "not found" in str(exc):
+                self._show_select_track_placeholder()
+                return
+
+            self._set_map_placeholder(title="Map preview failed", message=str(exc))
             QMessageBox.warning(self, "Map preview failed", str(exc))
 
     def _preview_selected_track(self) -> None:
         if self.track_list is None:
+            self._preview_visible_tracks_overview()
             return
 
-        item = self.track_list.currentItem()
-        if item is None:
+        selected_items = [
+            item
+            for item in self.track_list.selectedItems()
+            if item.data(TRACK_ID_ROLE) is not None
+        ]
+        if not selected_items:
+            self._preview_visible_tracks_overview()
             return
 
-        if item.data(TRACK_ID_ROLE) is None:
+        if len(selected_items) == 1:
+            self._open_track_preview(selected_items[0])
             return
 
-        self._open_track_preview(item)
+        self._open_selected_tracks_with_overlays(selected_items)
+
+    def _show_select_track_placeholder(self) -> None:
+        self._set_map_placeholder(
+            title="Map Preview",
+            message="Select a track for preview",
+        )
+
+    def _preview_temp_track(self, preview_path: Path, preview_name: str) -> None:
+        try:
+            if isinstance(self.map_service, LeafletMapService):
+                rendered = self.map_service.render_track(
+                    preview_path,
+                    preview_name,
+                    initial_overlays=self._map_overlay_state,
+                )
+            else:
+                rendered = self.map_service.render_track(preview_path, preview_name)
+            self._set_map_html(rendered.html)
+            self.statusBar().showMessage(f"Preview loaded: {preview_name}", 5000)
+        finally:
+            if preview_path.exists():
+                preview_path.unlink()
+
+    def _preview_visible_tracks_overview(self) -> None:
+        if not self._visible_tracks:
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="No tracks in this folder view.",
+            )
+            return
+
+        folder_path_by_id = self._build_folder_path_by_id()
+        track_inputs: list[tuple[int, Path, str, str]] = []
+        for track in self._visible_tracks:
+            managed_path = self.library_store.library_root / track.managed_rel_path
+            if managed_path.exists():
+                folder_path = folder_path_by_id.get(track.folder_id, "My Library")
+                hover_label = f"{folder_path}/{track.display_name}"
+                track_inputs.append((track.id, managed_path, track.display_name, hover_label))
+
+        if not track_inputs:
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="No valid track files in this folder view.",
+            )
+            return
+
+        if isinstance(self.map_service, LeafletMapService):
+            rendered = self.map_service.render_track_lines_preview(track_inputs)
+            self._set_map_html(rendered.html)
+            self.statusBar().showMessage(
+                f"Previewing {len(track_inputs)} track(s) in folder view",
+                5000,
+            )
+            return
+
+        self._show_select_track_placeholder()
+
+    def _build_folder_path_by_id(self) -> dict[int, str]:
+        folders = self.library_store.list_folders()
+        folder_by_id = {folder.id: folder for folder in folders}
+
+        path_by_id: dict[int, str] = {}
+        for folder in folders:
+            names: list[str] = []
+            current = folder
+            seen: set[int] = set()
+            while current is not None and current.id not in seen:
+                seen.add(current.id)
+                names.append(current.name)
+                if current.parent_id is None:
+                    break
+                current = folder_by_id.get(current.parent_id)
+
+            path_by_id[folder.id] = "/".join(reversed(names)) if names else "My Library"
+
+        return path_by_id
+
+    def _open_selected_tracks_with_overlays(self, selected_items: list[QListWidgetItem]) -> None:
+        track_inputs: list[tuple[Path, str]] = []
+        for item in selected_items:
+            track_id = int(item.data(TRACK_ID_ROLE))
+            managed_path = self.library_store.get_track_managed_path(track_id)
+            if managed_path.exists():
+                track_inputs.append((managed_path, item.text()))
+
+        if not track_inputs:
+            self._preview_visible_tracks_overview()
+            return
+
+        try:
+            if isinstance(self.map_service, LeafletMapService):
+                rendered = self.map_service.render_tracks_with_overlays(
+                    track_inputs,
+                    initial_overlays=self._map_overlay_state,
+                )
+            else:
+                rendered = self.map_service.render_track(track_inputs[0][0], track_inputs[0][1])
+            self._set_map_html(rendered.html)
+            self.statusBar().showMessage(
+                f"Loaded preview for {len(track_inputs)} selected track(s)",
+                5000,
+            )
+        except Exception as exc:
+            self._set_map_placeholder(title="Map preview failed", message=str(exc))
+            QMessageBox.warning(self, "Map preview failed", str(exc))
 
     def _set_map_html(self, html_content: str) -> None:
         self._current_map_html = html_content
@@ -1123,6 +1341,34 @@ class MainWindow(QMainWindow):
 
         params = parse_qs(fragment)
         action = params.get("action", [None])[0]
+        if action == "open_track":
+            track_id_raw = params.get("track_id", [None])[0]
+            if track_id_raw is not None:
+                try:
+                    track_id = int(track_id_raw)
+                    self._open_track_from_overview_map(track_id)
+                except ValueError:
+                    pass
+
+            if self.map_web_view is not None:
+                self.map_web_view.page().runJavaScript(
+                    "if (window.location.hash.startsWith('#gpxcmd=1')) { window.location.hash = ''; }",
+                )
+            return
+
+        if action == "overlay_state":
+            layer_name = params.get("layer", [None])[0]
+            enabled_raw = params.get("enabled", [None])[0]
+            if layer_name is not None and enabled_raw is not None:
+                enabled = enabled_raw in {"1", "true", "True"}
+                self._map_overlay_state[str(layer_name)] = enabled
+
+            if self.map_web_view is not None:
+                self.map_web_view.page().runJavaScript(
+                    "if (window.location.hash.startsWith('#gpxcmd=1')) { window.location.hash = ''; }",
+                )
+            return
+
         percent_raw = params.get("percent", [None])[0]
 
         try:
@@ -1139,6 +1385,18 @@ class MainWindow(QMainWindow):
                 "if (window.location.hash.startsWith('#gpxcmd=1')) { window.location.hash = ''; }",
             )
 
+    def _open_track_from_overview_map(self, track_id: int) -> None:
+        try:
+            track = self.library_store.get_track(track_id)
+        except ValueError:
+            self.statusBar().showMessage("Selected preview track is no longer available", 5000)
+            self._rerender_current_track_preview()
+            return
+
+        self._load_library_tree(selected_folder_id=track.folder_id)
+        self._reload_track_list(selected_track_id=track_id)
+        self.statusBar().showMessage(f"Selected track: {track.display_name}", 5000)
+
     def _run_map_point_action(self, action: str, percent: float) -> None:
         track_id = self._current_selected_track_id()
         if track_id is None:
@@ -1152,12 +1410,48 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Split point must be inside track range", 4000)
                 return
             try:
+                preview_a_path, preview_b_path = self.library_store.build_split_preview(
+                    track_id,
+                    split_percent=bounded,
+                )
+                self._preview_temp_track(preview_a_path, "Split preview (A)")
+                if preview_b_path.exists():
+                    preview_b_path.unlink()
+
+                reply = QMessageBox.question(
+                    self,
+                    "Split track",
+                    "Apply split and create two new track copies?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self._rerender_current_track_preview()
+                    return
+
                 part_a, part_b = self.library_store.split_track(track_id, split_percent=bounded)
                 self._reload_track_list(selected_track_id=part_a.id)
                 self.statusBar().showMessage(
                     f"Split from map: {part_a.display_name} and {part_b.display_name}",
                     6000,
                 )
+
+                state = {"track_ids": [part_a.id, part_b.id]}
+
+                def _undo() -> None:
+                    for generated_track_id in state["track_ids"]:
+                        self.library_store.move_track_to_trash(generated_track_id)
+                    self._reload_track_list(selected_track_id=track_id)
+
+                def _redo() -> None:
+                    new_a, new_b = self.library_store.split_track(
+                        track_id,
+                        split_percent=bounded,
+                    )
+                    state["track_ids"] = [new_a.id, new_b.id]
+                    self._reload_track_list(selected_track_id=new_a.id)
+
+                self._push_edit_command(_EditCommand(label="Split track", undo=_undo, redo=_redo))
             except Exception as exc:
                 QMessageBox.warning(self, "Split track failed", str(exc))
             return
@@ -1178,6 +1472,24 @@ class MainWindow(QMainWindow):
                 return
 
             try:
+                preview_path = self.library_store.build_trim_preview(
+                    track_id,
+                    start_percent=start_value,
+                    end_percent=end_value,
+                )
+                self._preview_temp_track(preview_path, "Trim preview")
+
+                reply = QMessageBox.question(
+                    self,
+                    "Trim track",
+                    "Apply trim and create a new track copy?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self._rerender_current_track_preview()
+                    return
+
                 trimmed = self.library_store.trim_track(
                     track_id,
                     start_percent=start_value,
@@ -1189,22 +1501,93 @@ class MainWindow(QMainWindow):
                     f"Trimmed from map: {trimmed.display_name}",
                     6000,
                 )
+
+                state = {"track_id": trimmed.id}
+
+                def _undo() -> None:
+                    self.library_store.move_track_to_trash(state["track_id"])
+                    self._reload_track_list(selected_track_id=track_id)
+
+                def _redo() -> None:
+                    new_trimmed = self.library_store.trim_track(
+                        track_id,
+                        start_percent=start_value,
+                        end_percent=end_value,
+                    )
+                    state["track_id"] = new_trimmed.id
+                    self._reload_track_list(selected_track_id=new_trimmed.id)
+
+                self._push_edit_command(_EditCommand(label="Trim track", undo=_undo, redo=_redo))
             except Exception as exc:
                 QMessageBox.warning(self, "Trim track failed", str(exc))
 
     def _rerender_current_track_preview(self) -> bool:
         if self.track_list is None:
+            self._preview_visible_tracks_overview()
             return False
 
-        item = self.track_list.currentItem()
-        if item is None:
+        selected_items = [
+            item
+            for item in self.track_list.selectedItems()
+            if item.data(TRACK_ID_ROLE) is not None
+        ]
+        if not selected_items:
+            self._preview_visible_tracks_overview()
             return False
 
-        if item.data(TRACK_ID_ROLE) is None:
-            return False
-
-        self._open_track_preview(item)
+        if len(selected_items) == 1:
+            self._open_track_preview(selected_items[0])
+        else:
+            self._open_selected_tracks_with_overlays(selected_items)
         return True
+
+    def _push_edit_command(self, command: _EditCommand) -> None:
+        self._undo_stack.append(command)
+        self._redo_stack.clear()
+        self._update_undo_redo_actions()
+
+    def _update_undo_redo_actions(self) -> None:
+        if self._undo_action is not None:
+            self._undo_action.setEnabled(bool(self._undo_stack))
+            if self._undo_stack:
+                self._undo_action.setText(f"Undo {self._undo_stack[-1].label}")
+            else:
+                self._undo_action.setText("Undo")
+
+        if self._redo_action is not None:
+            self._redo_action.setEnabled(bool(self._redo_stack))
+            if self._redo_stack:
+                self._redo_action.setText(f"Redo {self._redo_stack[-1].label}")
+            else:
+                self._redo_action.setText("Redo")
+
+    def _undo_last_edit(self) -> None:
+        if not self._undo_stack:
+            return
+
+        command = self._undo_stack.pop()
+        try:
+            command.undo()
+            self._redo_stack.append(command)
+            self.statusBar().showMessage(f"Undid: {command.label}", 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Undo failed", str(exc))
+        finally:
+            self._update_undo_redo_actions()
+
+    def _redo_last_edit(self) -> None:
+        if not self._redo_stack:
+            return
+
+        command = self._redo_stack.pop()
+        try:
+            command.redo()
+            self._undo_stack.append(command)
+            self.statusBar().showMessage(f"Redid: {command.label}", 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Redo failed", str(exc))
+        finally:
+            self._update_undo_redo_actions()
 
     def _reverse_selected_tracks(self) -> None:
         track_ids = self._selected_track_ids()
@@ -1213,20 +1596,38 @@ class MainWindow(QMainWindow):
             return
 
         track_id = track_ids[0]
+        try:
+            preview_path = self.library_store.build_reverse_preview(track_id)
+            self._preview_temp_track(preview_path, "Reverse preview")
+        except Exception as exc:
+            QMessageBox.warning(self, "Reverse preview failed", str(exc))
+            return
+
         reply = QMessageBox.question(
             self,
             "Reverse track",
-            "Reverse all track points in the selected GPX file?",
+            "Apply reverse to the selected track?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
+            self._rerender_current_track_preview()
             return
 
         try:
             self.library_store.reverse_track(track_id)
             self._reload_track_list(selected_track_id=track_id)
             self.statusBar().showMessage("Track reversed", 5000)
+
+            def _undo() -> None:
+                self.library_store.reverse_track(track_id)
+                self._reload_track_list(selected_track_id=track_id)
+
+            def _redo() -> None:
+                self.library_store.reverse_track(track_id)
+                self._reload_track_list(selected_track_id=track_id)
+
+            self._push_edit_command(_EditCommand(label="Reverse track", undo=_undo, redo=_redo))
         except Exception as exc:
             QMessageBox.warning(self, "Reverse track failed", str(exc))
 
@@ -1269,8 +1670,31 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            trimmed = self.library_store.trim_track(
+            preview_path = self.library_store.build_trim_preview(
                 track_ids[0],
+                start_percent=start_percent,
+                end_percent=end_percent,
+            )
+            self._preview_temp_track(preview_path, "Trim preview")
+        except Exception as exc:
+            QMessageBox.warning(self, "Trim preview failed", str(exc))
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Trim track",
+            "Apply trim and create a new track copy?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._rerender_current_track_preview()
+            return
+
+        try:
+            source_track_id = track_ids[0]
+            trimmed = self.library_store.trim_track(
+                source_track_id,
                 start_percent=start_percent,
                 end_percent=end_percent,
             )
@@ -1279,6 +1703,23 @@ class MainWindow(QMainWindow):
                 f"Created trimmed track: {trimmed.display_name}",
                 6000,
             )
+
+            state = {"track_id": trimmed.id}
+
+            def _undo() -> None:
+                self.library_store.move_track_to_trash(state["track_id"])
+                self._reload_track_list(selected_track_id=source_track_id)
+
+            def _redo() -> None:
+                new_trimmed = self.library_store.trim_track(
+                    source_track_id,
+                    start_percent=start_percent,
+                    end_percent=end_percent,
+                )
+                state["track_id"] = new_trimmed.id
+                self._reload_track_list(selected_track_id=new_trimmed.id)
+
+            self._push_edit_command(_EditCommand(label="Trim track", undo=_undo, redo=_redo))
         except Exception as exc:
             QMessageBox.warning(self, "Trim track failed", str(exc))
 
@@ -1301,8 +1742,32 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            part_a, part_b = self.library_store.split_track(
+            preview_a_path, preview_b_path = self.library_store.build_split_preview(
                 track_ids[0],
+                split_percent=split_percent,
+            )
+            self._preview_temp_track(preview_a_path, "Split preview (A)")
+            if preview_b_path.exists():
+                preview_b_path.unlink()
+        except Exception as exc:
+            QMessageBox.warning(self, "Split preview failed", str(exc))
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Split track",
+            "Apply split and create two new track copies?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._rerender_current_track_preview()
+            return
+
+        try:
+            source_track_id = track_ids[0]
+            part_a, part_b = self.library_store.split_track(
+                source_track_id,
                 split_percent=split_percent,
             )
             self._reload_track_list(selected_track_id=part_a.id)
@@ -1310,8 +1775,73 @@ class MainWindow(QMainWindow):
                 f"Created split tracks: {part_a.display_name} and {part_b.display_name}",
                 6000,
             )
+
+            state = {"track_ids": [part_a.id, part_b.id]}
+
+            def _undo() -> None:
+                for track_id in state["track_ids"]:
+                    self.library_store.move_track_to_trash(track_id)
+                self._reload_track_list(selected_track_id=source_track_id)
+
+            def _redo() -> None:
+                new_a, new_b = self.library_store.split_track(
+                    source_track_id,
+                    split_percent=split_percent,
+                )
+                state["track_ids"] = [new_a.id, new_b.id]
+                self._reload_track_list(selected_track_id=new_a.id)
+
+            self._push_edit_command(_EditCommand(label="Split track", undo=_undo, redo=_redo))
         except Exception as exc:
             QMessageBox.warning(self, "Split track failed", str(exc))
+
+    def _merge_selected_tracks(self) -> None:
+        track_ids = self._selected_track_ids()
+        if len(track_ids) < 2:
+            QMessageBox.information(self, "Merge tracks", "Please select at least two tracks.")
+            return
+
+        try:
+            preview_path = self.library_store.build_merge_preview(track_ids)
+            self._preview_temp_track(preview_path, "Merge preview")
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge preview failed", str(exc))
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Merge tracks",
+            f"Create a merged copy from {len(track_ids)} selected tracks?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._rerender_current_track_preview()
+            return
+
+        try:
+            source_track_ids = list(track_ids)
+            merged = self.library_store.merge_tracks(source_track_ids)
+            self._reload_track_list(selected_track_id=merged.id)
+            self.statusBar().showMessage(
+                f"Created merged track: {merged.display_name}",
+                6000,
+            )
+
+            state = {"track_id": merged.id}
+
+            def _undo() -> None:
+                self.library_store.move_track_to_trash(state["track_id"])
+                self._reload_track_list(selected_track_id=source_track_ids[0])
+
+            def _redo() -> None:
+                new_merged = self.library_store.merge_tracks(source_track_ids)
+                state["track_id"] = new_merged.id
+                self._reload_track_list(selected_track_id=new_merged.id)
+
+            self._push_edit_command(_EditCommand(label="Merge tracks", undo=_undo, redo=_redo))
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge tracks failed", str(exc))
 
     def _create_folder_dialog(self) -> None:
         parent_id = self._selected_folder_id()

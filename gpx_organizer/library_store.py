@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import copy
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import tempfile
 from typing import Any
 import xml.etree.ElementTree as ET
 
@@ -150,9 +152,8 @@ class LibraryStore:
                 SELECT id, parent_id, name, kind, position
                 FROM folders
                 ORDER BY
-                    CASE kind WHEN 'root' THEN 0 WHEN 'trash' THEN 2 ELSE 1 END,
+                    CASE kind WHEN 'root' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
                     parent_id,
-                    position,
                     name COLLATE NOCASE
                 """
             ).fetchall()
@@ -176,6 +177,28 @@ class LibraryStore:
                        file_hash, file_size, duplicate_of_track_id
                 FROM tracks
                 WHERE folder_id = ?
+                ORDER BY display_name COLLATE NOCASE
+                """,
+                (folder_id,),
+            ).fetchall()
+        return [_track_record_from_row(row) for row in rows]
+
+    def list_tracks_recursive(self, folder_id: int) -> list[TrackRecord]:
+        """Return tracks from folder_id and all descendant folders."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH RECURSIVE folder_tree(id) AS (
+                    SELECT ?
+                    UNION ALL
+                    SELECT f.id
+                    FROM folders f
+                    JOIN folder_tree ft ON f.parent_id = ft.id
+                )
+                SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
+                       file_hash, file_size, duplicate_of_track_id
+                FROM tracks
+                WHERE folder_id IN (SELECT id FROM folder_tree)
                 ORDER BY display_name COLLATE NOCASE
                 """,
                 (folder_id,),
@@ -380,67 +403,97 @@ class LibraryStore:
                 raise ValueError(f"Track id {track_id} not found")
 
     def import_gpx(self, source_path: Path, target_folder_id: int | None = None) -> ImportResult:
-        """Copy a GPX file into managed storage and create track metadata."""
+        """Copy a GPX file into managed storage and return the first imported track."""
+        results = self.import_gpx_all(source_path, target_folder_id=target_folder_id)
+        if not results:
+            raise ValueError(f"No track data imported from {source_path}")
+        return results[0]
+
+    def import_gpx_all(
+        self,
+        source_path: Path,
+        target_folder_id: int | None = None,
+    ) -> list[ImportResult]:
+        """Import all <trk> entries from a GPX file as separate managed tracks."""
         source = source_path.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"GPX file not found: {source}")
         if source.suffix.lower() != ".gpx":
             raise ValueError(f"Expected .gpx file, got: {source}")
 
-        file_hash = _sha256(source)
-        file_size = source.stat().st_size
+        track_entries = _extract_gpx_track_entries(source)
+        if not track_entries:
+            raise ValueError(f"No <trk> entries found in {source}")
+
+        total_tracks = len(track_entries)
+        imported: list[ImportResult] = []
 
         with self._connect() as conn:
             folder_id = target_folder_id if target_folder_id is not None else self.get_root_folder_id()
 
-            duplicate_row = conn.execute(
-                "SELECT id FROM tracks WHERE file_hash = ? ORDER BY id LIMIT 1",
-                (file_hash,),
-            ).fetchone()
-            duplicate_of_track_id = int(duplicate_row["id"]) if duplicate_row is not None else None
+            for idx, entry in enumerate(track_entries, start=1):
+                file_hash = hashlib.sha256(entry.gpx_bytes).hexdigest()
+                file_size = len(entry.gpx_bytes)
 
-            managed_name = _build_managed_filename(
-                desired_stem=source.stem,
-                suffix=".gpx",
-                target_dir=self.tracks_dir,
-                force_numbered=duplicate_of_track_id is not None,
-            )
-            managed_path = self.tracks_dir / managed_name
-            shutil.copy2(source, managed_path)
-
-            metadata = _extract_basic_metadata(managed_path)
-            now = _utc_now_iso()
-
-            conn.execute(
-                """
-                INSERT INTO tracks(
-                    folder_id, display_name, managed_rel_path, original_source_path,
-                    file_hash, file_size, duplicate_of_track_id, metadata_json, imported_at, updated_at
+                duplicate_row = conn.execute(
+                    "SELECT id FROM tracks WHERE file_hash = ? ORDER BY id LIMIT 1",
+                    (file_hash,),
+                ).fetchone()
+                duplicate_of_track_id = (
+                    int(duplicate_row["id"]) if duplicate_row is not None else None
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    folder_id,
-                    managed_name,
-                    str(managed_path.relative_to(self.library_root)),
-                    str(source),
-                    file_hash,
-                    file_size,
-                    duplicate_of_track_id,
-                    metadata,
-                    now,
-                    now,
-                ),
-            )
-            track_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
-        return ImportResult(
-            track_id=track_id,
-            display_name=managed_name,
-            managed_path=managed_path,
-            file_hash=file_hash,
-            is_duplicate=duplicate_of_track_id is not None,
-        )
+                fallback_stem = source.stem if total_tracks == 1 else f"{source.stem} {idx}"
+                managed_name = _build_managed_filename(
+                    desired_stem=entry.name if entry.name is not None else fallback_stem,
+                    suffix=".gpx",
+                    target_dir=self.tracks_dir,
+                    force_numbered=duplicate_of_track_id is not None,
+                )
+                managed_path = self.tracks_dir / managed_name
+                managed_path.write_bytes(entry.gpx_bytes)
+
+                metadata = _extract_basic_metadata(managed_path)
+                now = _utc_now_iso()
+
+                display_name = managed_name
+                if total_tracks > 1 and entry.name is not None and entry.name.strip():
+                    display_name = entry.name.strip()
+
+                conn.execute(
+                    """
+                    INSERT INTO tracks(
+                        folder_id, display_name, managed_rel_path, original_source_path,
+                        file_hash, file_size, duplicate_of_track_id, metadata_json, imported_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        folder_id,
+                        display_name,
+                        str(managed_path.relative_to(self.library_root)),
+                        str(source),
+                        file_hash,
+                        file_size,
+                        duplicate_of_track_id,
+                        metadata,
+                        now,
+                        now,
+                    ),
+                )
+                track_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+                imported.append(
+                    ImportResult(
+                        track_id=track_id,
+                        display_name=display_name,
+                        managed_path=managed_path,
+                        file_hash=file_hash,
+                        is_duplicate=duplicate_of_track_id is not None,
+                    )
+                )
+
+        return imported
 
     def move_track_to_trash(self, track_id: int) -> None:
         """Move track assignment to the dedicated Trash folder."""
@@ -488,6 +541,20 @@ class LibraryStore:
                 managed_path.unlink()
 
             conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+
+    def export_track(self, track_id: int, destination_path: Path, overwrite: bool = False) -> Path:
+        """Export a managed GPX track to a destination file path."""
+        source_path = self.get_track_managed_path(track_id)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+        target = destination_path.expanduser().resolve()
+        if target.exists() and not overwrite:
+            raise FileExistsError(f"Destination already exists: {target}")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target)
+        return target
 
     def rename_track(self, track_id: int, new_name: str) -> TrackRecord:
         """Rename physical managed file and update metadata row."""
@@ -849,6 +916,182 @@ class LibraryStore:
                 raise
 
             return record_a, record_b
+
+    def merge_tracks(self, track_ids: list[int]) -> TrackRecord:
+        """Create a merged copy from multiple source tracks."""
+        if len(track_ids) < 2:
+            raise ValueError("Please select at least two tracks to merge")
+
+        with self._connect() as conn:
+            source_tracks: list[TrackRecord] = []
+            for track_id in track_ids:
+                row = conn.execute(
+                    """
+                    SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
+                           file_hash, file_size, duplicate_of_track_id
+                    FROM tracks
+                    WHERE id = ?
+                    """,
+                    (track_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Track id {track_id} not found")
+                source_tracks.append(_track_record_from_row(row))
+
+            primary = source_tracks[0]
+            primary_path = self.library_root / primary.managed_rel_path
+            if not primary_path.exists():
+                raise FileNotFoundError(f"Managed GPX file missing: {primary_path}")
+
+            source_name = Path(primary.display_name)
+            merged_name = _build_managed_filename(
+                desired_stem=f"{source_name.stem} (merge)",
+                suffix=source_name.suffix if source_name.suffix else ".gpx",
+                target_dir=self.tracks_dir,
+                force_numbered=False,
+            )
+            merged_path = self.tracks_dir / merged_name
+            shutil.copy2(primary_path, merged_path)
+
+            try:
+                merged_points: list[ET.Element] = []
+                for source in source_tracks:
+                    source_path = self.library_root / source.managed_rel_path
+                    if not source_path.exists():
+                        raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+                    points = _extract_gpx_track_points(source_path)
+                    if len(points) < 2:
+                        raise ValueError("Each track must contain at least two points to merge")
+
+                    if merged_points and _same_track_point(merged_points[-1], points[0]):
+                        merged_points.extend(points[1:])
+                    else:
+                        merged_points.extend(points)
+
+                if len(merged_points) < 2:
+                    raise ValueError("Merged track has too few points")
+
+                _replace_gpx_track_points(merged_path, merged_points)
+                return self._insert_track_from_managed_file(
+                    conn=conn,
+                    folder_id=primary.folder_id,
+                    managed_path=merged_path,
+                    original_source_path=primary.original_source_path,
+                )
+            except Exception:
+                if merged_path.exists():
+                    merged_path.unlink()
+                raise
+
+    def build_reverse_preview(self, track_id: int) -> Path:
+        """Create a temporary GPX preview for reverse operation."""
+        source_path = self.get_track_managed_path(track_id)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+        preview_path = _create_temp_gpx_copy(source_path)
+        try:
+            _reverse_gpx_track_points(preview_path)
+            return preview_path
+        except Exception:
+            if preview_path.exists():
+                preview_path.unlink()
+            raise
+
+    def build_trim_preview(self, track_id: int, start_percent: float, end_percent: float) -> Path:
+        """Create a temporary GPX preview for trim operation."""
+        source_path = self.get_track_managed_path(track_id)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+        preview_path = _create_temp_gpx_copy(source_path)
+        try:
+            kept_points = _trim_gpx_track_points(preview_path, float(start_percent), float(end_percent))
+            if kept_points < 2:
+                raise ValueError("Trim result must contain at least two points")
+            return preview_path
+        except Exception:
+            if preview_path.exists():
+                preview_path.unlink()
+            raise
+
+    def build_split_preview(self, track_id: int, split_percent: float) -> tuple[Path, Path]:
+        """Create temporary GPX previews for split operation."""
+        source_path = self.get_track_managed_path(track_id)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+        preview_a_path = _create_temp_gpx_copy(source_path)
+        preview_b_path = _create_temp_gpx_copy(source_path)
+        try:
+            kept_a, kept_b = _split_gpx_track_points(
+                source_path,
+                preview_a_path,
+                preview_b_path,
+                float(split_percent),
+            )
+            if kept_a < 2 or kept_b < 2:
+                raise ValueError("Split result must contain at least two points per output")
+            return preview_a_path, preview_b_path
+        except Exception:
+            if preview_a_path.exists():
+                preview_a_path.unlink()
+            if preview_b_path.exists():
+                preview_b_path.unlink()
+            raise
+
+    def build_merge_preview(self, track_ids: list[int]) -> Path:
+        """Create a temporary GPX preview for merge operation."""
+        if len(track_ids) < 2:
+            raise ValueError("Please select at least two tracks to merge")
+
+        with self._connect() as conn:
+            source_tracks: list[TrackRecord] = []
+            for track_id in track_ids:
+                row = conn.execute(
+                    """
+                    SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
+                           file_hash, file_size, duplicate_of_track_id
+                    FROM tracks
+                    WHERE id = ?
+                    """,
+                    (track_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Track id {track_id} not found")
+                source_tracks.append(_track_record_from_row(row))
+
+        primary_path = self.library_root / source_tracks[0].managed_rel_path
+        if not primary_path.exists():
+            raise FileNotFoundError(f"Managed GPX file missing: {primary_path}")
+
+        preview_path = _create_temp_gpx_copy(primary_path)
+        try:
+            merged_points: list[ET.Element] = []
+            for source in source_tracks:
+                source_path = self.library_root / source.managed_rel_path
+                if not source_path.exists():
+                    raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+                points = _extract_gpx_track_points(source_path)
+                if len(points) < 2:
+                    raise ValueError("Each track must contain at least two points to merge")
+
+                if merged_points and _same_track_point(merged_points[-1], points[0]):
+                    merged_points.extend(points[1:])
+                else:
+                    merged_points.extend(points)
+
+            if len(merged_points) < 2:
+                raise ValueError("Merged track has too few points")
+
+            _replace_gpx_track_points(preview_path, merged_points)
+            return preview_path
+        except Exception:
+            if preview_path.exists():
+                preview_path.unlink()
+            raise
 
     def _insert_track_from_managed_file(
         self,
@@ -1219,6 +1462,115 @@ def _replace_gpx_track_points(target_path: Path, points: list[ET.Element]) -> No
         new_segment.append(copy.deepcopy(point))
 
     tree.write(target_path, encoding="utf-8", xml_declaration=True)
+
+
+def _extract_gpx_track_points(gpx_path: Path) -> list[ET.Element]:
+    tree = ET.parse(gpx_path)
+    root = tree.getroot()
+
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", maxsplit=1)[0][1:]
+        trk_path = f".//{{{namespace}}}trk"
+        trkseg_tag = f"{{{namespace}}}trkseg"
+        trkpt_tag = f"{{{namespace}}}trkpt"
+    else:
+        trk_path = ".//trk"
+        trkseg_tag = "trkseg"
+        trkpt_tag = "trkpt"
+
+    track = root.find(trk_path)
+    if track is None:
+        raise ValueError("GPX track element not found")
+
+    points: list[ET.Element] = []
+    for segment in track.findall(trkseg_tag):
+        points.extend(list(segment.findall(trkpt_tag)))
+
+    return points
+
+
+def _create_temp_gpx_copy(source_path: Path) -> Path:
+    temp_handle = tempfile.NamedTemporaryFile(suffix=".gpx", delete=False)
+    temp_path = Path(temp_handle.name)
+    temp_handle.close()
+    shutil.copy2(source_path, temp_path)
+    return temp_path
+
+
+def _same_track_point(left: ET.Element, right: ET.Element) -> bool:
+    left_ele = left.find("ele")
+    right_ele = right.find("ele")
+    left_time = left.find("time")
+    right_time = right.find("time")
+
+    return (
+        left.get("lat") == right.get("lat")
+        and left.get("lon") == right.get("lon")
+        and (left_ele.text if left_ele is not None else None)
+        == (right_ele.text if right_ele is not None else None)
+        and (left_time.text if left_time is not None else None)
+        == (right_time.text if right_time is not None else None)
+    )
+
+
+@dataclass(frozen=True)
+class _TrackImportEntry:
+    name: str | None
+    gpx_bytes: bytes
+
+
+def _extract_gpx_track_entries(source_path: Path) -> list[_TrackImportEntry]:
+    tree = ET.parse(source_path)
+    root = tree.getroot()
+
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", maxsplit=1)[0][1:]
+        trk_path = f".//{{{namespace}}}trk"
+        trk_name_tag = f"{{{namespace}}}name"
+    else:
+        namespace = None
+        trk_path = ".//trk"
+        trk_name_tag = "name"
+
+    tracks = root.findall(trk_path)
+    entries: list[_TrackImportEntry] = []
+
+    for track in tracks:
+        track_name_element = track.find(trk_name_tag)
+        track_name = None
+        if track_name_element is not None and track_name_element.text:
+            track_name = track_name_element.text.strip()
+
+        cloned_root = copy.deepcopy(root)
+        cloned_tracks = cloned_root.findall(trk_path)
+        for cloned_track in cloned_tracks:
+            parent = _find_xml_parent(cloned_root, cloned_track)
+            if parent is None:
+                continue
+            parent.remove(cloned_track)
+
+        target_parent = cloned_root
+        if namespace is not None:
+            for child in list(cloned_root):
+                if child.tag == f"{{{namespace}}}trk":
+                    target_parent = cloned_root
+                    break
+
+        target_parent.append(copy.deepcopy(track))
+
+        buffer = BytesIO()
+        ET.ElementTree(cloned_root).write(buffer, encoding="utf-8", xml_declaration=True)
+        entries.append(_TrackImportEntry(name=track_name, gpx_bytes=buffer.getvalue()))
+
+    return entries
+
+
+def _find_xml_parent(root: ET.Element, target: ET.Element) -> ET.Element | None:
+    for parent in root.iter():
+        for child in list(parent):
+            if child is target:
+                return parent
+    return None
 
 
 def _read_gpx_display_color(gpx_path: Path) -> str | None:

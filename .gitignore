@@ -1574,3 +1574,10 @@ __pycache__/gpx_analyzer.cpython-311.pyc
 .venv-qt/lib/python3.11/site-packages/setuptools-66.1.1.dist-info/REQUESTED
 .venv-qt/lib/python3.11/site-packages/setuptools-66.1.1.dist-info/top_level.txt
 .venv-qt/lib/python3.11/site-packages/setuptools-66.1.1.dist-info/WHEEL
+gpx_organizer/__pycache__/library_store.cpython-311.pyc
+gpx_organizer/__pycache__/main_window.cpython-311.pyc
+gpx_organizer/__pycache__/map_service.cpython-311.pyc
+gpx_organizer/__pycache__/settings_store.cpython-311.pyc
+tests/__pycache__/test_library_store.cpython-311-pytest-9.1.1.pyc
+tests/__pycache__/test_map_service.cpython-311-pytest-9.1.1.pyc
+tests/__pycache__/test_settings_store.cpython-311-pytest-9.1.1.pyc

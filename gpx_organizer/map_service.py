@@ -24,7 +24,7 @@ DEFAULT_REST_STOP_COLOR = "#AB47BC"
 DEFAULT_TRACK_COLOR = "#007F5F"
 DEFAULT_DISTANCE_MARKER_COLOR = "#37474F"
 DEFAULT_DIRECTION_ARROW_COLOR = "#1F1F1F"
-DEFAULT_DIRECTION_ARROW_INTERVAL_KM = 0.5
+DEFAULT_DIRECTION_ARROW_INTERVAL_KM = 1.5
 DEFAULT_DIRECTION_ARROW_SIZE_PX = 12
 DEFAULT_TRACK_POINT_COLOR = "#000000"
 DEFAULT_TRACK_POINT_SIZE_PX = 1
@@ -45,7 +45,12 @@ class RenderedMap:
 class MapService(Protocol):
     """Interface for converting track data into embeddable map HTML."""
 
-    def render_track(self, track_path: Path, track_name: str) -> RenderedMap:
+    def render_track(
+      self,
+      track_path: Path,
+      track_name: str,
+      initial_overlays: dict[str, bool] | None = None,
+    ) -> RenderedMap:
         """Render a GPX track into HTML for the embedded map panel."""
 
 
@@ -84,12 +89,14 @@ class LeafletMapService:
         self.track_point_color = _normalize_hex_color(track_point_color, DEFAULT_TRACK_POINT_COLOR)
         self.track_point_size_px = max(1, min(10, int(track_point_size_px)))
 
-    def render_track(self, track_path: Path, track_name: str) -> RenderedMap:
-        analyzer = GPXAnalyzer()
-        analyzer.read_gpx_file(track_path)
-        points = analyzer.get_track_points()
-
-        if not points:
+    def render_track(
+      self,
+      track_path: Path,
+      track_name: str,
+      initial_overlays: dict[str, bool] | None = None,
+    ) -> RenderedMap:
+      payload = self._build_track_payload(track_path, track_name)
+      if payload is None:
             return RenderedMap(
                 title=track_name,
                 html=self._build_message_html(
@@ -98,65 +105,151 @@ class LeafletMapService:
                 ),
             )
 
-        stats = analyzer.calculate_ride_stats(track_points=points)
-        rest_stops = analyzer.find_rest_stops(
-          track_points=points,
-          radius_m=5.0,
-          min_duration_s=120.0,
-        )
+      return RenderedMap(
+        title=track_name,
+        html=self._build_leaflet_html(payload, initial_overlays=initial_overlays),
+      )
 
-        coordinates = [
-          {
-            "lat": point.latitude,
-            "lon": point.longitude,
-            "ele": point.elevation_m,
-            "time": point.time.isoformat() if point.time is not None else None,
-          }
-          for point in points
-        ]
+    def render_track_lines_preview(
+      self,
+      tracks: list[
+        tuple[Path, str]
+        | tuple[int, Path, str]
+        | tuple[int, Path, str, str]
+      ],
+    ) -> RenderedMap:
+      """Render a lightweight overview of multiple tracks as simple faded lines."""
+      entries: list[dict[str, object]] = []
+      for track_entry in tracks:
+        if len(track_entry) == 4:
+          track_id, track_path, track_name, hover_label = track_entry
+        elif len(track_entry) == 3:
+          track_id, track_path, track_name = track_entry
+          hover_label = track_name
+        else:
+          track_id = None
+          track_path, track_name = track_entry
+          hover_label = track_name
 
-        start = coordinates[0]
-        end = coordinates[-1]
-        distance_markers = self._build_distance_markers(points, interval_km=10.0)
-        direction_arrows = self._build_direction_arrows(
-            points,
-            interval_km=self.direction_arrow_interval_km,
-        )
-        total_distance_km = round(stats["total_distance_m"] / 1000.0, 2)
+        coordinates = _extract_gpx_line_coordinates(track_path)
+        if len(coordinates) < 2:
+          continue
+
         track_color = _read_track_display_color(track_path) or self.default_track_color
-
-        payload = {
-            "coordinates": coordinates,
-            "start": start,
-            "end": end,
-            "trackName": track_name,
-          "totalDistanceKm": total_distance_km,
-          "trackColor": track_color,
-          "restStopColor": self.rest_stop_color,
-          "distanceMarkerColor": self.distance_marker_color,
-          "directionArrowColor": self.direction_arrow_color,
-          "directionArrowSizePx": self.direction_arrow_size_px,
-          "trackPointColor": self.track_point_color,
-          "trackPointSizePx": self.track_point_size_px,
-          "distanceMarkers": distance_markers,
-          "directionArrows": direction_arrows,
-          "restStops": [
-            {
-              "lat": stop.latitude,
-              "lon": stop.longitude,
-              "startTime": stop.start_time.isoformat(),
-              "endTime": stop.end_time.isoformat(),
-              "durationMin": round(stop.duration_s / 60.0, 1),
-              "elevation": stop.elevation_m,
-            }
-            for stop in rest_stops
-          ],
-        }
-
-        return RenderedMap(
-            title=track_name,
-            html=self._build_leaflet_html(payload),
+        entries.append(
+          {
+            "name": track_name,
+            "trackId": track_id,
+            "hoverLabel": str(hover_label),
+            "trackColor": _lighten_hex_color(track_color),
+            "coordinates": _downsample_coordinates(coordinates, max_points=1200),
+          }
         )
+
+      if not entries:
+        return self.render_placeholder(
+          title="Map Preview",
+          message="No tracks in this folder view.",
+        )
+
+      return RenderedMap(
+        title="Track Overview",
+        html=self._build_track_lines_preview_html(entries),
+      )
+
+    def render_tracks_with_overlays(
+      self,
+      tracks: list[tuple[Path, str]],
+      initial_overlays: dict[str, bool] | None = None,
+    ) -> RenderedMap:
+      """Render one or more selected tracks with standard overlay controls."""
+      payloads: list[dict[str, object]] = []
+      for track_path, track_name in tracks:
+        payload = self._build_track_payload(track_path, track_name)
+        if payload is not None:
+          payloads.append(payload)
+
+      if not payloads:
+        return self.render_placeholder(
+          title="Map Preview",
+          message="No valid track points found for selected tracks.",
+        )
+
+      if len(payloads) == 1:
+        return RenderedMap(
+          title=str(payloads[0]["trackName"]),
+          html=self._build_leaflet_html(payloads[0], initial_overlays=initial_overlays),
+        )
+
+      return RenderedMap(
+        title=f"{len(payloads)} selected tracks",
+        html=self._build_multi_track_leaflet_html(payloads, initial_overlays=initial_overlays),
+      )
+
+    def _build_track_payload(self, track_path: Path, track_name: str) -> dict[str, object] | None:
+      analyzer = GPXAnalyzer()
+      analyzer.read_gpx_file(track_path)
+      points = analyzer.get_track_points()
+
+      if not points:
+        return None
+
+      stats = analyzer.calculate_ride_stats(track_points=points)
+      rest_stops = analyzer.find_rest_stops(
+        track_points=points,
+        radius_m=5.0,
+        min_duration_s=120.0,
+      )
+
+      coordinates = [
+        {
+          "lat": point.latitude,
+          "lon": point.longitude,
+          "ele": point.elevation_m,
+          "time": point.time.isoformat() if point.time is not None else None,
+        }
+        for point in points
+      ]
+
+      start = coordinates[0]
+      end = coordinates[-1]
+      distance_markers = self._build_distance_markers(points, interval_km=10.0)
+      direction_arrows = self._build_direction_arrows(
+          points,
+          interval_km=self.direction_arrow_interval_km,
+      )
+      total_distance_km = round(stats["total_distance_m"] / 1000.0, 2)
+      track_color = _read_track_display_color(track_path) or self.default_track_color
+
+      payload = {
+          "coordinates": coordinates,
+          "start": start,
+          "end": end,
+          "trackName": track_name,
+        "totalDistanceKm": total_distance_km,
+        "trackColor": track_color,
+        "restStopColor": self.rest_stop_color,
+        "distanceMarkerColor": self.distance_marker_color,
+        "directionArrowColor": self.direction_arrow_color,
+        "directionArrowSizePx": self.direction_arrow_size_px,
+        "trackPointColor": self.track_point_color,
+        "trackPointSizePx": self.track_point_size_px,
+        "distanceMarkers": distance_markers,
+        "directionArrows": direction_arrows,
+        "restStops": [
+          {
+            "lat": stop.latitude,
+            "lon": stop.longitude,
+            "startTime": stop.start_time.isoformat(),
+            "endTime": stop.end_time.isoformat(),
+            "durationMin": round(stop.duration_s / 60.0, 1),
+            "elevation": stop.elevation_m,
+          }
+          for stop in rest_stops
+        ],
+      }
+
+      return payload
 
     def render_placeholder(self, title: str, message: str) -> RenderedMap:
         """Create a simple placeholder HTML payload."""
@@ -182,8 +275,13 @@ class LeafletMapService:
 </html>
 """
 
-    def _build_leaflet_html(self, payload: dict[str, object]) -> str:
+    def _build_leaflet_html(
+      self,
+      payload: dict[str, object],
+      initial_overlays: dict[str, bool] | None = None,
+    ) -> str:
         payload_json = json.dumps(payload)
+        initial_overlays_json = json.dumps(initial_overlays or {})
         responsive_threshold_px = self.responsive_threshold_px
         bicycle_route_tile_url_json = json.dumps(self.bicycle_route_tile_url)
         bicycle_route_attribution_json = json.dumps(self.bicycle_route_attribution)
@@ -261,7 +359,7 @@ class LeafletMapService:
   </head>
   <body>
     <div id=\"map\"></div>
-    <div class=\"legend\"><strong id=\"track-title\"></strong><br/>Milestone 5 map preview</div>
+    <div class=\"legend\"><strong id=\"track-title\"></strong><br/>Milestone 6 map preview</div>
     <div id=\"point-menu\" class=\"map-point-menu\">
       <button data-action=\"split\">Split</button>
       <button data-action=\"trim_start\">Trim Start</button>
@@ -274,6 +372,7 @@ class LeafletMapService:
     ></script>
     <script>
       const payload = {payload_json};
+      const initialOverlays = {initial_overlays_json};
       const responsiveThresholdPx = {responsive_threshold_px};
       const map = L.map("map");
       L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
@@ -299,6 +398,16 @@ class LeafletMapService:
         rests: L.layerGroup().addTo(map),
         directionArrows: L.layerGroup().addTo(map),
       }};
+      const layerRegistry = {{
+        gradient: layers.gradient,
+        points: layers.points,
+        endpoints: layers.endpoints,
+        distance: layers.distance,
+        directionArrows: layers.directionArrows,
+        rests: layers.rests,
+        bicycleRoutes: bicycleRoutesLayer,
+      }};
+      let suppressOverlayEvents = true;
 
       function haversineMeters(a, b) {{
         const toRad = (deg) => (deg * Math.PI) / 180;
@@ -386,16 +495,110 @@ class LeafletMapService:
         }}
       }}
 
+      function emitOverlayState(layerName, enabled) {{
+        window.location.hash =
+          `gpxcmd=1&action=overlay_state&layer=${{encodeURIComponent(layerName)}}&enabled=${{enabled ? 1 : 0}}`;
+      }}
+
+      function setLayerEnabled(layerName, enabled) {{
+        const layer = layerRegistry[layerName];
+        if (!layer) {{
+          return;
+        }}
+        if (enabled) {{
+          if (!map.hasLayer(layer)) {{
+            map.addLayer(layer);
+          }}
+          return;
+        }}
+        if (map.hasLayer(layer)) {{
+          map.removeLayer(layer);
+        }}
+      }}
+
       map.on("overlayadd", (event) => {{
         if (event.layer === layers.gradient) {{
           applyGradientMode(true);
+          if (!suppressOverlayEvents) {{
+            emitOverlayState("gradient", true);
+          }}
+          return;
+        }}
+        if (event.layer === layers.points) {{
+          if (!suppressOverlayEvents) emitOverlayState("points", true);
+          return;
+        }}
+        if (event.layer === layers.endpoints) {{
+          if (!suppressOverlayEvents) emitOverlayState("endpoints", true);
+          return;
+        }}
+        if (event.layer === layers.distance) {{
+          if (!suppressOverlayEvents) emitOverlayState("distance", true);
+          return;
+        }}
+        if (event.layer === layers.directionArrows) {{
+          if (!suppressOverlayEvents) emitOverlayState("directionArrows", true);
+          return;
+        }}
+        if (event.layer === layers.rests) {{
+          if (!suppressOverlayEvents) emitOverlayState("rests", true);
+          return;
+        }}
+        if (event.layer === bicycleRoutesLayer) {{
+          if (!suppressOverlayEvents) emitOverlayState("bicycleRoutes", true);
         }}
       }});
       map.on("overlayremove", (event) => {{
         if (event.layer === layers.gradient) {{
           applyGradientMode(false);
+          if (!suppressOverlayEvents) {{
+            emitOverlayState("gradient", false);
+          }}
+          return;
+        }}
+        if (event.layer === layers.points) {{
+          if (!suppressOverlayEvents) emitOverlayState("points", false);
+          return;
+        }}
+        if (event.layer === layers.endpoints) {{
+          if (!suppressOverlayEvents) emitOverlayState("endpoints", false);
+          return;
+        }}
+        if (event.layer === layers.distance) {{
+          if (!suppressOverlayEvents) emitOverlayState("distance", false);
+          return;
+        }}
+        if (event.layer === layers.directionArrows) {{
+          if (!suppressOverlayEvents) emitOverlayState("directionArrows", false);
+          return;
+        }}
+        if (event.layer === layers.rests) {{
+          if (!suppressOverlayEvents) emitOverlayState("rests", false);
+          return;
+        }}
+        if (event.layer === bicycleRoutesLayer) {{
+          if (!suppressOverlayEvents) emitOverlayState("bicycleRoutes", false);
         }}
       }});
+
+      const overlayDefaults = {{
+        gradient: true,
+        points: false,
+        endpoints: true,
+        distance: true,
+        directionArrows: true,
+        rests: true,
+        bicycleRoutes: false,
+      }};
+      const overlayState = Object.assign({{}}, overlayDefaults, initialOverlays);
+      setLayerEnabled("points", !!overlayState.points);
+      setLayerEnabled("endpoints", !!overlayState.endpoints);
+      setLayerEnabled("distance", !!overlayState.distance);
+      setLayerEnabled("directionArrows", !!overlayState.directionArrows);
+      setLayerEnabled("rests", !!overlayState.rests);
+      setLayerEnabled("bicycleRoutes", !!overlayState.bicycleRoutes);
+      applyGradientMode(!!overlayState.gradient);
+      suppressOverlayEvents = false;
 
       window.__gpxFitTrack = function() {{
         const bounds = layers.gradient.getBounds();
@@ -550,6 +753,381 @@ class LeafletMapService:
 </html>
 """
 
+    def _build_track_lines_preview_html(self, tracks: list[dict[str, object]]) -> str:
+        tracks_json = json.dumps(tracks)
+        return f"""
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+    <link
+      rel=\"stylesheet\"
+      href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"
+      integrity=\"sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=\"
+      crossorigin=\"\"
+    />
+    <style>
+      html, body, #map {{ width: 100%; height: 100%; margin: 0; padding: 0; }}
+      .legend {{
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        top: 12px;
+        z-index: 1000;
+        background: rgba(255, 255, 255, 0.92);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-family: sans-serif;
+        font-size: 12px;
+        line-height: 1.3;
+        text-align: center;
+      }}
+    </style>
+  </head>
+  <body>
+    <div id=\"map\"></div>
+    <div class=\"legend\"><strong id=\"overview-title\"></strong></div>
+    <script
+      src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"
+      integrity=\"sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=\"
+      crossorigin=\"\"
+    ></script>
+    <script>
+      const tracks = {tracks_json};
+      const map = L.map(\"map\");
+      L.tileLayer(\"https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png\", {{
+        maxZoom: 19,
+        attribution: \"&copy; OpenStreetMap contributors\"
+      }}).addTo(map);
+
+      const group = L.featureGroup().addTo(map);
+
+      function openTrackById(trackId) {{
+        if (trackId === null || trackId === undefined) {{
+          return;
+        }}
+        window.location.hash = `gpxcmd=1&action=open_track&track_id=${{encodeURIComponent(String(trackId))}}`;
+      }}
+
+      tracks.forEach((track) => {{
+        const latLngs = track.coordinates.map((p) => [p.lat, p.lon]);
+        const polyline = L.polyline(latLngs, {{
+          color: track.trackColor,
+          weight: 4,
+          opacity: 0.72,
+        }}).addTo(group);
+
+        polyline.bindTooltip(track.hoverLabel, {{
+          sticky: true,
+          direction: "top",
+          opacity: 0.92,
+        }});
+
+        polyline.on("mouseover", () => {{
+          polyline.setStyle({{ weight: 6, opacity: 0.95 }});
+        }});
+
+        polyline.on("mouseout", () => {{
+          polyline.setStyle({{ weight: 4, opacity: 0.72 }});
+        }});
+
+        polyline.on("click", () => {{
+          openTrackById(track.trackId);
+        }});
+      }});
+
+      window.__gpxFitTrack = function() {{
+        const bounds = group.getBounds();
+        if (bounds && bounds.isValid()) {{
+          map.fitBounds(bounds, {{ padding: [24, 24] }});
+        }}
+      }};
+      window.__gpxFitTrack();
+
+      document.getElementById(\"overview-title\").textContent =
+        `${{tracks.length}} track(s) in current folder view`;
+    </script>
+  </body>
+</html>
+"""
+
+    def _build_multi_track_leaflet_html(
+      self,
+      tracks: list[dict[str, object]],
+      initial_overlays: dict[str, bool] | None = None,
+    ) -> str:
+        tracks_json = json.dumps(tracks)
+        initial_overlays_json = json.dumps(initial_overlays or {})
+        responsive_threshold_px = self.responsive_threshold_px
+        bicycle_route_tile_url_json = json.dumps(self.bicycle_route_tile_url)
+        bicycle_route_attribution_json = json.dumps(self.bicycle_route_attribution)
+        return f"""
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+    <link
+      rel=\"stylesheet\"
+      href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"
+      integrity=\"sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=\"
+      crossorigin=\"\"
+    />
+    <style>
+      html, body, #map {{ width: 100%; height: 100%; margin: 0; padding: 0; }}
+      .legend {{
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        top: 12px;
+        z-index: 1000;
+        background: rgba(255, 255, 255, 0.92);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-family: sans-serif;
+        font-size: 12px;
+        line-height: 1.3;
+        text-align: center;
+      }}
+      @media (max-width: {responsive_threshold_px}px) {{
+        .legend {{ font-size: 11px; padding: 6px 8px; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <div id=\"map\"></div>
+    <div class=\"legend\"><strong id=\"track-title\"></strong></div>
+    <script
+      src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"
+      const initialOverlays = {initial_overlays_json};
+      integrity=\"sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=\"
+      crossorigin=\"\"
+    ></script>
+    <script>
+      const tracks = {tracks_json};
+      const map = L.map(\"map\");
+      L.tileLayer(\"https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png\", {{
+        maxZoom: 19,
+        attribution: \"&copy; OpenStreetMap contributors\"
+      }}).addTo(map);
+
+      const bicycleRoutesLayer = L.tileLayer({bicycle_route_tile_url_json}, {{
+        maxZoom: 18,
+        opacity: 0.85,
+        attribution: {bicycle_route_attribution_json}
+      }});
+
+      const layers = {{
+        track: L.featureGroup().addTo(map),
+        gradient: L.featureGroup().addTo(map),
+        points: L.layerGroup(),
+        endpoints: L.layerGroup().addTo(map),
+        distance: L.layerGroup().addTo(map),
+        rests: L.layerGroup().addTo(map),
+        directionArrows: L.layerGroup().addTo(map),
+      }};
+      const layerRegistry = {{
+        gradient: layers.gradient,
+        points: layers.points,
+        endpoints: layers.endpoints,
+        distance: layers.distance,
+        directionArrows: layers.directionArrows,
+        rests: layers.rests,
+        bicycleRoutes: bicycleRoutesLayer,
+      }};
+      let suppressOverlayEvents = true;
+
+      function haversineMeters(a, b) {{
+        const toRad = (deg) => (deg * Math.PI) / 180;
+        const earth = 6371000;
+        const dLat = toRad(b.lat - a.lat);
+        const dLon = toRad(b.lon - a.lon);
+        const lat1 = toRad(a.lat);
+        const lat2 = toRad(b.lat);
+        const x =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+        return earth * (2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x)));
+      }}
+
+      function gradeColor(gradePercent) {{
+        if (gradePercent <= -10) return \"#0B3D2E\";
+        if (gradePercent <= -6) return \"#1E7A47\";
+        if (gradePercent <= -2) return \"#6CCB5F\";
+        if (gradePercent < 2) return \"#F2D64B\";
+        if (gradePercent < 5) return \"#F7B267\";
+        if (gradePercent < 8) return \"#EE8F39\";
+        if (gradePercent < 10) return \"#E57373\";
+        return \"#8B0000\";
+      }}
+
+      tracks.forEach((track) => {{
+        const coordinates = track.coordinates;
+        const latLngs = coordinates.map((p) => [p.lat, p.lon]);
+        L.polyline(latLngs, {{ color: track.trackColor, weight: 5, opacity: 0.92 }}).addTo(layers.track);
+
+        coordinates.forEach((point) => {{
+          L.circleMarker([point.lat, point.lon], {{
+            radius: track.trackPointSizePx,
+            color: track.trackPointColor,
+            fillColor: track.trackPointColor,
+            fillOpacity: 0.9,
+            weight: 1,
+          }}).addTo(layers.points);
+        }});
+
+        for (let i = 0; i < coordinates.length - 1; i += 1) {{
+          const a = coordinates[i];
+          const b = coordinates[i + 1];
+          const horiz = haversineMeters(a, b);
+          let grade = null;
+          if (a.ele !== null && b.ele !== null && horiz > 0.5) {{
+            grade = ((b.ele - a.ele) / horiz) * 100;
+          }}
+          const color = grade === null ? track.trackColor : gradeColor(grade);
+          L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {{ color, weight: 5, opacity: 0.92 }}).addTo(layers.gradient);
+        }}
+
+        L.circleMarker([track.start.lat, track.start.lon], {{ radius: 8, color: \"#2e7d32\", fillOpacity: 1 }})
+          .addTo(layers.endpoints)
+          .bindPopup(`<strong>${{track.trackName}} - Start</strong>`);
+        L.circleMarker([track.end.lat, track.end.lon], {{ radius: 8, color: \"#c62828\", fillOpacity: 1 }})
+          .addTo(layers.endpoints)
+          .bindPopup(`<strong>${{track.trackName}} - End</strong>`);
+
+        track.distanceMarkers.forEach((marker) => {{
+          L.circleMarker([marker.lat, marker.lon], {{
+            radius: 5,
+            color: track.distanceMarkerColor,
+            fillColor: \"#ffffff\",
+            fillOpacity: 1,
+            weight: 2,
+          }}).addTo(layers.distance);
+        }});
+
+        track.restStops.forEach((stop) => {{
+          L.circleMarker([stop.lat, stop.lon], {{
+            radius: 6,
+            color: track.restStopColor,
+            fillColor: track.restStopColor,
+            fillOpacity: 0.85,
+            weight: 2,
+          }}).addTo(layers.rests);
+        }});
+
+        track.directionArrows.forEach((arrow) => {{
+          const glyphRotationDeg = arrow.bearingDeg - 90;
+          const arrowSizePx = track.directionArrowSizePx;
+          const arrowHalfPx = arrowSizePx / 2;
+          const arrowIcon = L.divIcon({{
+            className: \"direction-arrow-icon\",
+            html: (
+              `<div style=\"width:${{arrowSizePx}}px;height:${{arrowSizePx}}px;display:flex;align-items:center;justify-content:center;line-height:1;font-size:${{arrowSizePx + 6}}px;font-weight:900;color:${{track.directionArrowColor}};transform:rotate(${{glyphRotationDeg}}deg);\">&gt;</div>`
+            ),
+            iconSize: [arrowSizePx, arrowSizePx],
+            iconAnchor: [arrowHalfPx, arrowHalfPx],
+          }});
+          L.marker([arrow.lat, arrow.lon], {{ icon: arrowIcon }}).addTo(layers.directionArrows);
+        }});
+      }});
+
+      function applyGradientMode(gradientEnabled) {{
+        if (gradientEnabled) {{
+          if (!map.hasLayer(layers.gradient)) map.addLayer(layers.gradient);
+          if (map.hasLayer(layers.track)) map.removeLayer(layers.track);
+          return;
+        }}
+        if (map.hasLayer(layers.gradient)) map.removeLayer(layers.gradient);
+        if (!map.hasLayer(layers.track)) map.addLayer(layers.track);
+      }}
+
+      function emitOverlayState(layerName, enabled) {{
+        window.location.hash =
+          `gpxcmd=1&action=overlay_state&layer=${{encodeURIComponent(layerName)}}&enabled=${{enabled ? 1 : 0}}`;
+      }}
+
+      function setLayerEnabled(layerName, enabled) {{
+        const layer = layerRegistry[layerName];
+        if (!layer) return;
+        if (enabled) {{
+          if (!map.hasLayer(layer)) map.addLayer(layer);
+          return;
+        }}
+        if (map.hasLayer(layer)) map.removeLayer(layer);
+      }}
+
+      map.on(\"overlayadd\", (event) => {{
+        if (event.layer === layers.gradient) {{
+          applyGradientMode(true);
+          if (!suppressOverlayEvents) emitOverlayState("gradient", true);
+          return;
+        }}
+        if (event.layer === layers.points) {{ if (!suppressOverlayEvents) emitOverlayState("points", true); return; }}
+        if (event.layer === layers.endpoints) {{ if (!suppressOverlayEvents) emitOverlayState("endpoints", true); return; }}
+        if (event.layer === layers.distance) {{ if (!suppressOverlayEvents) emitOverlayState("distance", true); return; }}
+        if (event.layer === layers.directionArrows) {{ if (!suppressOverlayEvents) emitOverlayState("directionArrows", true); return; }}
+        if (event.layer === layers.rests) {{ if (!suppressOverlayEvents) emitOverlayState("rests", true); return; }}
+        if (event.layer === bicycleRoutesLayer) {{ if (!suppressOverlayEvents) emitOverlayState("bicycleRoutes", true); }}
+      }});
+      map.on(\"overlayremove\", (event) => {{
+        if (event.layer === layers.gradient) {{
+          applyGradientMode(false);
+          if (!suppressOverlayEvents) emitOverlayState("gradient", false);
+          return;
+        }}
+        if (event.layer === layers.points) {{ if (!suppressOverlayEvents) emitOverlayState("points", false); return; }}
+        if (event.layer === layers.endpoints) {{ if (!suppressOverlayEvents) emitOverlayState("endpoints", false); return; }}
+        if (event.layer === layers.distance) {{ if (!suppressOverlayEvents) emitOverlayState("distance", false); return; }}
+        if (event.layer === layers.directionArrows) {{ if (!suppressOverlayEvents) emitOverlayState("directionArrows", false); return; }}
+        if (event.layer === layers.rests) {{ if (!suppressOverlayEvents) emitOverlayState("rests", false); return; }}
+        if (event.layer === bicycleRoutesLayer) {{ if (!suppressOverlayEvents) emitOverlayState("bicycleRoutes", false); }}
+      }});
+
+      const overlayDefaults = {{
+        gradient: true,
+        points: false,
+        endpoints: true,
+        distance: true,
+        directionArrows: true,
+        rests: true,
+        bicycleRoutes: false,
+      }};
+      const overlayState = Object.assign({{}}, overlayDefaults, initialOverlays);
+      setLayerEnabled("points", !!overlayState.points);
+      setLayerEnabled("endpoints", !!overlayState.endpoints);
+      setLayerEnabled("distance", !!overlayState.distance);
+      setLayerEnabled("directionArrows", !!overlayState.directionArrows);
+      setLayerEnabled("rests", !!overlayState.rests);
+      setLayerEnabled("bicycleRoutes", !!overlayState.bicycleRoutes);
+      applyGradientMode(!!overlayState.gradient);
+      suppressOverlayEvents = false;
+
+      window.__gpxFitTrack = function() {{
+        const bounds = layers.track.getBounds();
+        if (bounds && bounds.isValid()) {{
+          map.fitBounds(bounds, {{ padding: [24, 24] }});
+        }}
+      }};
+      window.__gpxFitTrack();
+
+      const isNarrowDisplay = window.innerWidth < {responsive_threshold_px};
+      L.control.layers(null, {{
+        \"Show Gradient\": layers.gradient,
+        \"Track Points\": layers.points,
+        \"Start/End\": layers.endpoints,
+        \"Distance Markers\": layers.distance,
+        \"Direction Arrows\": layers.directionArrows,
+        \"Rest Stops\": layers.rests,
+        \"Bicycle Routes\": bicycleRoutesLayer,
+      }}, {{ collapsed: isNarrowDisplay, position: \"bottomright\" }}).addTo(map);
+
+      document.getElementById(\"track-title\").textContent = `${{tracks.length}} selected tracks`;
+    </script>
+  </body>
+</html>
+"""
+
     def _build_distance_markers(
         self,
         points: list[TrackPoint],
@@ -667,6 +1245,18 @@ def _normalize_hex_color(color: str, fallback: str) -> str:
     return fallback
 
 
+def _lighten_hex_color(color: str, factor: float = 0.3) -> str:
+    value = _normalize_hex_color(color, DEFAULT_TRACK_COLOR)
+    red = int(value[1:3], 16)
+    green = int(value[3:5], 16)
+    blue = int(value[5:7], 16)
+
+    red = int(red + (255 - red) * factor)
+    green = int(green + (255 - green) * factor)
+    blue = int(blue + (255 - blue) * factor)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
 def _read_track_display_color(track_path: Path) -> str | None:
     root = ET.parse(track_path).getroot()
     track = root.find(f".//{{{GPX_NS}}}trk")
@@ -685,3 +1275,54 @@ def _read_track_display_color(track_path: Path) -> str | None:
     if not HEX_COLOR_RE.match(value):
         return None
     return value
+
+
+def _extract_gpx_line_coordinates(track_path: Path) -> list[dict[str, float]]:
+    root = ET.parse(track_path).getroot()
+    coordinates: list[dict[str, float]] = []
+
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", maxsplit=1)[0][1:]
+        trkseg_path = f".//{{{namespace}}}trkseg"
+        trkpt_tag = f"{{{namespace}}}trkpt"
+    else:
+        trkseg_path = ".//trkseg"
+        trkpt_tag = "trkpt"
+
+    for segment in root.findall(trkseg_path):
+        for point in segment.findall(trkpt_tag):
+            lat_text = point.get("lat")
+            lon_text = point.get("lon")
+            if lat_text is None or lon_text is None:
+                continue
+            try:
+                coordinates.append(
+                    {
+                        "lat": float(lat_text),
+                        "lon": float(lon_text),
+                    }
+                )
+            except ValueError:
+                continue
+
+    return coordinates
+
+
+def _downsample_coordinates(
+    coordinates: list[dict[str, float]],
+    max_points: int,
+) -> list[dict[str, float]]:
+    if len(coordinates) <= max_points:
+        return coordinates
+
+    if max_points < 2:
+        return [coordinates[0], coordinates[-1]]
+
+    step = (len(coordinates) - 1) / float(max_points - 1)
+    sampled: list[dict[str, float]] = []
+    for index in range(max_points):
+        src_index = int(round(index * step))
+        src_index = max(0, min(len(coordinates) - 1, src_index))
+        sampled.append(coordinates[src_index])
+
+    return sampled

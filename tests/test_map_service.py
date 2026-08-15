@@ -68,6 +68,7 @@ def test_render_track_supports_configurable_threshold_and_bicycle_overlay(tmp_pa
     assert "Trim End" in rendered.html
     assert "window.location.hash = `gpxcmd=1" in rendered.html
     assert "points: L.layerGroup()," in rendered.html
+    assert "const initialOverlays =" in rendered.html
 
 
 def test_render_track_supports_direction_arrow_color_and_interval(tmp_path: Path) -> None:
@@ -97,3 +98,66 @@ def test_render_track_default_arrow_interval_is_half_km(tmp_path: Path) -> None:
     assert '"directionArrowSizePx": 12' in rendered.html
     assert '"trackPointColor": "#000000"' in rendered.html
     assert '"trackPointSizePx": 1' in rendered.html
+
+
+def test_render_track_lines_preview_for_multiple_tracks(tmp_path: Path) -> None:
+    gpx_a = tmp_path / "a.gpx"
+    gpx_b = tmp_path / "b.gpx"
+    gpx_a.write_text(SAMPLE_GPX.replace("Sample", "A"), encoding="utf-8")
+    gpx_b.write_text(SAMPLE_GPX.replace("Sample", "B"), encoding="utf-8")
+
+    service = LeafletMapService()
+    rendered = service.render_track_lines_preview(
+        [
+            (gpx_a, "Track A"),
+            (gpx_b, "Track B"),
+        ]
+    )
+
+    assert rendered.title == "Track Overview"
+    assert "track(s) in current folder view" in rendered.html
+    assert "L.featureGroup().addTo(map)" in rendered.html
+
+
+def test_render_tracks_with_overlays_for_multiple_tracks(tmp_path: Path) -> None:
+    gpx_a = tmp_path / "a.gpx"
+    gpx_b = tmp_path / "b.gpx"
+    gpx_a.write_text(SAMPLE_GPX.replace("Sample", "A"), encoding="utf-8")
+    gpx_b.write_text(SAMPLE_GPX.replace("Sample", "B"), encoding="utf-8")
+
+    service = LeafletMapService(direction_arrow_interval_km=0.5)
+    rendered = service.render_tracks_with_overlays(
+        [
+            (gpx_a, "Track A"),
+            (gpx_b, "Track B"),
+        ]
+    )
+
+    assert rendered.title == "2 selected tracks"
+    assert "Track Points" in rendered.html
+    assert "Direction Arrows" in rendered.html
+    assert "Rest Stops" in rendered.html
+    assert "selected tracks" in rendered.html
+
+
+def test_render_track_lines_preview_contains_each_track_entry(tmp_path: Path) -> None:
+    gpx_a = tmp_path / "a.gpx"
+    gpx_b = tmp_path / "b.gpx"
+    gpx_a.write_text(SAMPLE_GPX.replace("Sample", "A"), encoding="utf-8")
+    gpx_b.write_text(SAMPLE_GPX.replace("Sample", "B"), encoding="utf-8")
+
+    service = LeafletMapService()
+    rendered = service.render_track_lines_preview(
+        [
+            (11, gpx_a, "Track A", "My Library/folder1/subfolder/Track A"),
+            (22, gpx_b, "Track B", "My Library/folder2/Track B"),
+        ]
+    )
+
+    assert '"name": "Track A"' in rendered.html
+    assert '"name": "Track B"' in rendered.html
+    assert '"trackId": 11' in rendered.html
+    assert '"hoverLabel": "My Library/folder1/subfolder/Track A"' in rendered.html
+    assert "bindTooltip(track.hoverLabel" in rendered.html
+    assert "action=open_track&track_id=" in rendered.html
+    assert "window.__gpxFitTrack = function()" in rendered.html
