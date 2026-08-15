@@ -1,5 +1,5 @@
 # GPX Organizer
-This is a Python App which I am developing to get rid of my Windows Computer and garmin basecamp, which I preferably use to store and organize all my GPX tracks which I record during my bicycle tours.
+This is a Python App which I am developing to get rid of my Windows Computer and Garmin Basecamp, which I preferably use to store and organize all my GPX tracks recorded during my bicycle tours.
 
 It already has the basic funcionality of Garmin basecamp, though some features are still missing, since development is going on.
 So this is almost a Beta version.
