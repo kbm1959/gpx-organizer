@@ -5,6 +5,6 @@ It already has the basic funcionality of Garmin basecamp, though some features a
 So this is almost a Beta version.
 
 Actually I am developing and running it on a Raspberry Pi 5 with bookworm installed. 
-The final Version should run on most Unix derivates as well as on Windows Computers.
+The final version should run on most Unix derivates as well as on Windows Computers.
 
 You are welcome to test it and any hints concerning bugs or improvements are appreciated.
