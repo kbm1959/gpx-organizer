@@ -71,13 +71,13 @@ def test_render_track_supports_configurable_threshold_and_bicycle_overlay(tmp_pa
     assert "const initialOverlays =" in rendered.html
 
 
-def test_render_track_supports_direction_arrow_color_and_interval(tmp_path: Path) -> None:
+def test_render_track_supports_direction_arrow_color_and_count(tmp_path: Path) -> None:
     gpx_path = tmp_path / "sample.gpx"
     gpx_path.write_text(SAMPLE_GPX, encoding="utf-8")
 
     service = LeafletMapService(
         direction_arrow_color="#CC5500",
-        direction_arrow_interval_km=0.5,
+        direction_arrow_count=6,
         direction_arrow_size_px=18,
     )
     rendered = service.render_track(gpx_path, "Sample Ride")
@@ -85,10 +85,13 @@ def test_render_track_supports_direction_arrow_color_and_interval(tmp_path: Path
     assert '"directionArrowColor": "#CC5500"' in rendered.html
     assert '"directionArrowSizePx": 18' in rendered.html
     assert "directionArrows" in rendered.html
-    assert "arrow.bearingDeg - 90" in rendered.html
+    assert "updateDirectionArrowsForViewport" in rendered.html
+    assert 'map.on("moveend", updateDirectionArrowsForViewport);' in rendered.html
+    assert rendered.html.count('"bearingDeg"') == 6
+    assert "L.control.scale({ imperial: false }).addTo(map);" in rendered.html
 
 
-def test_render_track_default_arrow_interval_is_half_km(tmp_path: Path) -> None:
+def test_render_track_default_arrow_count_is_ten(tmp_path: Path) -> None:
     gpx_path = tmp_path / "sample.gpx"
     gpx_path.write_text(SAMPLE_GPX, encoding="utf-8")
 
@@ -96,6 +99,7 @@ def test_render_track_default_arrow_interval_is_half_km(tmp_path: Path) -> None:
     rendered = service.render_track(gpx_path, "Sample Ride")
 
     assert '"directionArrowSizePx": 12' in rendered.html
+    assert rendered.html.count('"bearingDeg"') == 10
     assert '"trackPointColor": "#000000"' in rendered.html
     assert '"trackPointSizePx": 1' in rendered.html
 
@@ -117,6 +121,7 @@ def test_render_track_lines_preview_for_multiple_tracks(tmp_path: Path) -> None:
     assert rendered.title == "Track Overview"
     assert "track(s) in current folder view" in rendered.html
     assert "L.featureGroup().addTo(map)" in rendered.html
+    assert "L.control.scale({ imperial: false }).addTo(map);" in rendered.html
 
 
 def test_render_tracks_with_overlays_for_multiple_tracks(tmp_path: Path) -> None:
@@ -125,7 +130,7 @@ def test_render_tracks_with_overlays_for_multiple_tracks(tmp_path: Path) -> None
     gpx_a.write_text(SAMPLE_GPX.replace("Sample", "A"), encoding="utf-8")
     gpx_b.write_text(SAMPLE_GPX.replace("Sample", "B"), encoding="utf-8")
 
-    service = LeafletMapService(direction_arrow_interval_km=0.5)
+    service = LeafletMapService(direction_arrow_count=7)
     rendered = service.render_tracks_with_overlays(
         [
             (gpx_a, "Track A"),
@@ -138,6 +143,7 @@ def test_render_tracks_with_overlays_for_multiple_tracks(tmp_path: Path) -> None
     assert "Direction Arrows" in rendered.html
     assert "Rest Stops" in rendered.html
     assert "selected tracks" in rendered.html
+    assert "L.control.scale({ imperial: false }).addTo(map);" in rendered.html
 
 
 def test_render_track_lines_preview_contains_each_track_entry(tmp_path: Path) -> None:

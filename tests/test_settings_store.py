@@ -93,7 +93,7 @@ def test_map_color_preferences_persist(tmp_path: Path, monkeypatch) -> None:
     assert settings_store.set_map_default_track_color("#445566") == "#445566"
     assert settings_store.set_map_distance_marker_color("#778899") == "#778899"
     assert settings_store.set_map_direction_arrow_color("#AA5500") == "#AA5500"
-    assert settings_store.set_map_direction_arrow_interval_km(1.8) == 1.8
+    assert settings_store.set_map_direction_arrow_count(14) == 14
     assert settings_store.set_map_direction_arrow_size_px(18) == 18
     assert settings_store.set_map_track_point_color("#010203") == "#010203"
     assert settings_store.set_map_track_point_size_px(5) == 5
@@ -102,7 +102,7 @@ def test_map_color_preferences_persist(tmp_path: Path, monkeypatch) -> None:
     assert settings_store.get_map_default_track_color() == "#445566"
     assert settings_store.get_map_distance_marker_color() == "#778899"
     assert settings_store.get_map_direction_arrow_color() == "#AA5500"
-    assert settings_store.get_map_direction_arrow_interval_km() == 1.8
+    assert settings_store.get_map_direction_arrow_count() == 14
     assert settings_store.get_map_direction_arrow_size_px() == 18
     assert settings_store.get_map_track_point_color() == "#010203"
     assert settings_store.get_map_track_point_size_px() == 5
@@ -129,7 +129,7 @@ def test_map_color_preferences_fall_back_on_invalid_values(tmp_path: Path, monke
             "map_default_track_color": "#12",
             "map_distance_marker_color": "red",
             "map_direction_arrow_color": "teal",
-            "map_direction_arrow_interval_km": "999",
+            "map_direction_arrow_count": "999",
             "map_direction_arrow_size_px": "500",
             "map_track_point_color": "white",
             "map_track_point_size_px": "33",
@@ -150,8 +150,8 @@ def test_map_color_preferences_fall_back_on_invalid_values(tmp_path: Path, monke
         == settings_store.DEFAULT_MAP_DIRECTION_ARROW_COLOR
     )
     assert (
-        settings_store.get_map_direction_arrow_interval_km()
-        == settings_store.MAX_MAP_DIRECTION_ARROW_INTERVAL_KM
+        settings_store.get_map_direction_arrow_count()
+        == settings_store.MAX_MAP_DIRECTION_ARROW_COUNT
     )
     assert (
         settings_store.get_map_direction_arrow_size_px()
@@ -167,7 +167,7 @@ def test_map_color_preferences_fall_back_on_invalid_values(tmp_path: Path, monke
     )
 
 
-def test_map_direction_arrow_interval_default_is_half_km(tmp_path: Path, monkeypatch) -> None:
+def test_map_direction_arrow_count_default_is_ten(tmp_path: Path, monkeypatch) -> None:
     config_root = tmp_path / "config"
 
     def fake_get_app_paths():
@@ -182,7 +182,7 @@ def test_map_direction_arrow_interval_default_is_half_km(tmp_path: Path, monkeyp
     monkeypatch.setattr(settings_store, "get_app_paths", fake_get_app_paths)
     loaded = settings_store.load_settings()
 
-    assert loaded["map_direction_arrow_interval_km"] == "0.5"
+    assert loaded["map_direction_arrow_count"] == "10"
     assert loaded["map_direction_arrow_size_px"] == "12"
     assert loaded["map_track_point_color"] == "#000000"
     assert loaded["map_track_point_size_px"] == "1"
