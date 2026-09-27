@@ -10,7 +10,7 @@ QT_BINDING = ""
 
 try:
     from PyQt6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, pyqtSignal as Signal
-    from PyQt6.QtGui import QDrag
+    from PyQt6.QtGui import QColor, QDrag, QIcon, QPainter, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -31,10 +31,12 @@ try:
         QMainWindow,
         QMenu,
         QMessageBox,
+        QProgressDialog,
         QPushButton,
         QSpinBox,
         QSplitter,
         QStatusBar,
+        QStyle,
         QTabWidget,
         QTreeWidget,
         QTreeWidgetItem,
@@ -50,7 +52,7 @@ try:
     QT_BINDING = "PyQt6"
 except ImportError:
     from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
-    from PySide6.QtGui import QDrag
+    from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -71,10 +73,12 @@ except ImportError:
         QMainWindow,
         QMenu,
         QMessageBox,
+        QProgressDialog,
         QPushButton,
         QSpinBox,
         QSplitter,
         QStatusBar,
+        QStyle,
         QTabWidget,
         QTreeWidget,
         QTreeWidgetItem,
@@ -93,6 +97,7 @@ except ImportError:
 __all__ = [
     "QApplication",
     "QCheckBox",
+    "QColor",
     "QColorDialog",
     "QComboBox",
     "QDialog",
@@ -105,6 +110,7 @@ __all__ = [
     "QGridLayout",
     "QHBoxLayout",
     "QInputDialog",
+    "QIcon",
     "QLabel",
     "QLineEdit",
     "QListWidget",
@@ -114,10 +120,14 @@ __all__ = [
     "QMessageBox",
     "QMimeData",
     "QPoint",
+    "QProgressDialog",
+    "QPainter",
+    "QPixmap",
     "QPushButton",
     "QSpinBox",
     "QSplitter",
     "QStatusBar",
+    "QStyle",
     "QTabWidget",
     "QTimer",
     "QTreeWidget",

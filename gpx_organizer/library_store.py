@@ -22,6 +22,7 @@ from gpx_analyzer import GPXAnalyzer
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+COPY_SUFFIX_RE = re.compile(r"^(.*)\s\((\d+)\)$")
 
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 GPX_ORGANIZER_EXT_NS = "https://gpx-organizer.dev/xmlns/1"
@@ -51,6 +52,7 @@ class TrackRecord:
     file_hash: str
     file_size: int
     duplicate_of_track_id: int | None
+    entry_kind: str = "track"
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class ImportResult:
     managed_path: Path
     file_hash: str
     is_duplicate: bool
+    entry_kind: str = "track"
 
 
 class LibraryStore:
@@ -94,6 +97,7 @@ class LibraryStore:
                 CREATE TABLE IF NOT EXISTS tracks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE RESTRICT,
+                    entry_kind TEXT NOT NULL DEFAULT 'track' CHECK (entry_kind IN ('track', 'waypoint')),
                     display_name TEXT NOT NULL,
                     managed_rel_path TEXT NOT NULL UNIQUE,
                     original_source_path TEXT NOT NULL,
@@ -115,6 +119,18 @@ class LibraryStore:
                 CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
                 """
             )
+
+            track_columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(tracks)").fetchall()
+            }
+            if "entry_kind" not in track_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE tracks
+                    ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'track'
+                    CHECK (entry_kind IN ('track', 'waypoint'))
+                    """
+                )
 
             now = _utc_now_iso()
             root_row = conn.execute(
@@ -174,7 +190,7 @@ class LibraryStore:
             rows = conn.execute(
                 """
                 SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
-                       file_hash, file_size, duplicate_of_track_id
+                           file_hash, file_size, duplicate_of_track_id, entry_kind
                 FROM tracks
                 WHERE folder_id = ?
                 ORDER BY display_name COLLATE NOCASE
@@ -196,7 +212,7 @@ class LibraryStore:
                     JOIN folder_tree ft ON f.parent_id = ft.id
                 )
                 SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
-                       file_hash, file_size, duplicate_of_track_id
+                           file_hash, file_size, duplicate_of_track_id, entry_kind
                 FROM tracks
                 WHERE folder_id IN (SELECT id FROM folder_tree)
                 ORDER BY display_name COLLATE NOCASE
@@ -211,7 +227,7 @@ class LibraryStore:
             row = conn.execute(
                 """
                 SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
-                       file_hash, file_size, duplicate_of_track_id
+                           file_hash, file_size, duplicate_of_track_id, entry_kind
                 FROM tracks
                 WHERE id = ?
                 """,
@@ -315,8 +331,29 @@ class LibraryStore:
             if kind in {"root", "trash"}:
                 raise ValueError("Root and Trash folders cannot be deleted")
 
-            folder_ids = self._collect_subtree_ids(conn, folder_id)
-            trash_id = self.get_trash_folder_id()
+            folder_ids = [
+                int(subtree_row["id"])
+                for subtree_row in conn.execute(
+                    """
+                    WITH RECURSIVE folder_tree(id) AS (
+                        SELECT id FROM folders WHERE id = ?
+                        UNION ALL
+                        SELECT f.id
+                        FROM folders f
+                        JOIN folder_tree ft ON f.parent_id = ft.id
+                    )
+                    SELECT id FROM folder_tree
+                    """,
+                    (folder_id,),
+                ).fetchall()
+            ]
+
+            trash_row = conn.execute(
+                "SELECT id FROM folders WHERE kind = 'trash' LIMIT 1"
+            ).fetchone()
+            if trash_row is None:
+                raise RuntimeError("Trash folder missing. Did you call initialize()?")
+            trash_id = int(trash_row["id"])
 
             placeholders = ",".join("?" for _ in folder_ids)
             params: list[Any] = [trash_id, _utc_now_iso(), *folder_ids]
@@ -324,8 +361,10 @@ class LibraryStore:
                 f"UPDATE tracks SET folder_id = ?, updated_at = ? WHERE folder_id IN ({placeholders})",
                 tuple(params),
             )
-
-            conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+            conn.execute(
+                f"DELETE FROM folders WHERE id IN ({placeholders})",
+                tuple(folder_ids),
+            )
 
     def move_folder(self, folder_id: int, new_parent_id: int | None) -> None:
         """Move a normal folder under a different parent."""
@@ -402,6 +441,179 @@ class LibraryStore:
             if updated.rowcount == 0:
                 raise ValueError(f"Track id {track_id} not found")
 
+    def copy_items_to_folder(self, item_ids: list[int], folder_id: int) -> list[TrackRecord]:
+        """Copy managed GPX items (tracks/waypoints) into another folder."""
+        if not item_ids:
+            return []
+
+        with self._connect() as conn:
+            target = conn.execute("SELECT id FROM folders WHERE id = ?", (folder_id,)).fetchone()
+            if target is None:
+                raise ValueError(f"Folder id {folder_id} not found")
+
+            copied: list[TrackRecord] = []
+            for item_id in item_ids:
+                row = conn.execute(
+                    """
+                    SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
+                           file_hash, file_size, duplicate_of_track_id, entry_kind, metadata_json
+                    FROM tracks
+                    WHERE id = ?
+                    """,
+                    (item_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Track id {item_id} not found")
+
+                source = _track_record_from_row(row)
+                source_path = self.library_root / source.managed_rel_path
+                if not source_path.exists():
+                    raise FileNotFoundError(f"Managed GPX file missing: {source_path}")
+
+                copied_display_name = _build_copy_track_display_name(
+                    conn,
+                    folder_id=folder_id,
+                    source_display_name=source.display_name,
+                )
+
+                source_name = Path(copied_display_name)
+                copied_filename = _build_managed_filename(
+                    desired_stem=source_name.stem,
+                    suffix=source_name.suffix if source_name.suffix else ".gpx",
+                    target_dir=self.tracks_dir,
+                    force_numbered=False,
+                )
+                copied_path = self.tracks_dir / copied_filename
+                shutil.copy2(source_path, copied_path)
+
+                copied_record = self._insert_item_from_managed_file(
+                    conn=conn,
+                    folder_id=folder_id,
+                    managed_path=copied_path,
+                    original_source_path=source.original_source_path,
+                    entry_kind=source.entry_kind,
+                    metadata_override=(str(row["metadata_json"]) if row["metadata_json"] is not None else None),
+                    display_name_override=copied_display_name,
+                )
+                copied.append(copied_record)
+
+            return copied
+
+    def copy_folder_subtree(self, folder_id: int, new_parent_id: int) -> int:
+        """Copy a normal folder subtree under new_parent_id and return new root folder id."""
+        with self._connect() as conn:
+            source_row = conn.execute(
+                "SELECT id, parent_id, name, kind FROM folders WHERE id = ?",
+                (folder_id,),
+            ).fetchone()
+            if source_row is None:
+                raise ValueError(f"Folder id {folder_id} not found")
+
+            if str(source_row["kind"]) in {"root", "trash"}:
+                raise ValueError("Root and Trash folders cannot be copied")
+
+            target_row = conn.execute(
+                "SELECT id FROM folders WHERE id = ?",
+                (new_parent_id,),
+            ).fetchone()
+            if target_row is None:
+                raise ValueError(f"Target parent folder id {new_parent_id} not found")
+
+            folder_ids = self._collect_subtree_ids(conn, folder_id)
+            folder_rows = {
+                int(row["id"]): row
+                for row in conn.execute(
+                    "SELECT id, parent_id, name, kind FROM folders WHERE id IN ({})".format(
+                        ",".join("?" for _ in folder_ids)
+                    ),
+                    tuple(folder_ids),
+                ).fetchall()
+            }
+
+            id_map: dict[int, int] = {}
+            copied_root_id: int | None = None
+            now = _utc_now_iso()
+
+            for old_folder_id in folder_ids:
+                row = folder_rows[old_folder_id]
+                old_parent = int(row["parent_id"]) if row["parent_id"] is not None else None
+                source_name = str(row["name"])
+
+                if old_folder_id == folder_id:
+                    parent_id = new_parent_id
+                    folder_name = _build_copy_folder_name(conn, parent_id=parent_id, source_name=source_name)
+                else:
+                    if old_parent is None or old_parent not in id_map:
+                        raise ValueError("Folder copy failed due to inconsistent subtree")
+                    parent_id = id_map[old_parent]
+                    folder_name = source_name
+
+                pos_row = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM folders WHERE parent_id = ?",
+                    (parent_id,),
+                ).fetchone()
+                next_pos = int(pos_row["next_pos"])
+
+                conn.execute(
+                    """
+                    INSERT INTO folders(parent_id, name, kind, position, created_at, updated_at)
+                    VALUES (?, ?, 'normal', ?, ?, ?)
+                    """,
+                    (parent_id, folder_name, next_pos, now, now),
+                )
+                new_folder_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                id_map[old_folder_id] = new_folder_id
+                if copied_root_id is None:
+                    copied_root_id = new_folder_id
+
+                track_rows = conn.execute(
+                    """
+                    SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
+                           file_hash, file_size, duplicate_of_track_id, entry_kind, metadata_json
+                    FROM tracks
+                    WHERE folder_id = ?
+                    ORDER BY display_name COLLATE NOCASE
+                    """,
+                    (old_folder_id,),
+                ).fetchall()
+
+                for track_row in track_rows:
+                    source_track = _track_record_from_row(track_row)
+                    source_path = self.library_root / source_track.managed_rel_path
+                    if not source_path.exists():
+                        continue
+
+                    copied_display_name = _build_copy_track_display_name(
+                        conn,
+                        folder_id=new_folder_id,
+                        source_display_name=source_track.display_name,
+                    )
+                    source_name_path = Path(copied_display_name)
+                    copied_filename = _build_managed_filename(
+                        desired_stem=source_name_path.stem,
+                        suffix=source_name_path.suffix if source_name_path.suffix else ".gpx",
+                        target_dir=self.tracks_dir,
+                        force_numbered=False,
+                    )
+                    copied_path = self.tracks_dir / copied_filename
+                    shutil.copy2(source_path, copied_path)
+
+                    self._insert_item_from_managed_file(
+                        conn=conn,
+                        folder_id=new_folder_id,
+                        managed_path=copied_path,
+                        original_source_path=source_track.original_source_path,
+                        entry_kind=source_track.entry_kind,
+                        metadata_override=(
+                            str(track_row["metadata_json"]) if track_row["metadata_json"] is not None else None
+                        ),
+                        display_name_override=copied_display_name,
+                    )
+
+            if copied_root_id is None:
+                raise ValueError("Folder copy failed")
+            return copied_root_id
+
     def import_gpx(self, source_path: Path, target_folder_id: int | None = None) -> ImportResult:
         """Copy a GPX file into managed storage and return the first imported track."""
         results = self.import_gpx_all(source_path, target_folder_id=target_folder_id)
@@ -414,24 +626,24 @@ class LibraryStore:
         source_path: Path,
         target_folder_id: int | None = None,
     ) -> list[ImportResult]:
-        """Import all <trk> entries from a GPX file as separate managed tracks."""
+        """Import all <trk> and <wpt> entries from a GPX file as separate managed files."""
         source = source_path.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"GPX file not found: {source}")
         if source.suffix.lower() != ".gpx":
             raise ValueError(f"Expected .gpx file, got: {source}")
 
-        track_entries = _extract_gpx_track_entries(source)
-        if not track_entries:
-            raise ValueError(f"No <trk> entries found in {source}")
+        import_entries = _extract_gpx_import_entries(source)
+        if not import_entries:
+            raise ValueError(f"No <trk> or <wpt> entries found in {source}")
 
-        total_tracks = len(track_entries)
+        total_entries = len(import_entries)
         imported: list[ImportResult] = []
 
         with self._connect() as conn:
             folder_id = target_folder_id if target_folder_id is not None else self.get_root_folder_id()
 
-            for idx, entry in enumerate(track_entries, start=1):
+            for idx, entry in enumerate(import_entries, start=1):
                 file_hash = hashlib.sha256(entry.gpx_bytes).hexdigest()
                 file_size = len(entry.gpx_bytes)
 
@@ -443,7 +655,10 @@ class LibraryStore:
                     int(duplicate_row["id"]) if duplicate_row is not None else None
                 )
 
-                fallback_stem = source.stem if total_tracks == 1 else f"{source.stem} {idx}"
+                entry_label = "waypoint" if entry.entry_kind == "waypoint" else "track"
+                fallback_stem = (
+                    source.stem if total_entries == 1 else f"{source.stem} {entry_label} {idx}"
+                )
                 managed_name = _build_managed_filename(
                     desired_stem=entry.name if entry.name is not None else fallback_stem,
                     suffix=".gpx",
@@ -457,19 +672,20 @@ class LibraryStore:
                 now = _utc_now_iso()
 
                 display_name = managed_name
-                if total_tracks > 1 and entry.name is not None and entry.name.strip():
+                if total_entries > 1 and entry.name is not None and entry.name.strip():
                     display_name = entry.name.strip()
 
                 conn.execute(
                     """
                     INSERT INTO tracks(
-                        folder_id, display_name, managed_rel_path, original_source_path,
+                        folder_id, entry_kind, display_name, managed_rel_path, original_source_path,
                         file_hash, file_size, duplicate_of_track_id, metadata_json, imported_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         folder_id,
+                        entry.entry_kind,
                         display_name,
                         str(managed_path.relative_to(self.library_root)),
                         str(source),
@@ -490,6 +706,7 @@ class LibraryStore:
                         managed_path=managed_path,
                         file_hash=file_hash,
                         is_duplicate=duplicate_of_track_id is not None,
+                        entry_kind=entry.entry_kind,
                     )
                 )
 
@@ -581,6 +798,21 @@ class LibraryStore:
             current = _track_record_from_row(row)
             old_path = self.library_root / current.managed_rel_path
 
+            candidate_display_name = f"{cleaned_stem}{old_path.suffix if old_path.suffix else '.gpx'}"
+            duplicate_name_row = conn.execute(
+                """
+                SELECT id
+                FROM tracks
+                WHERE id != ? AND lower(display_name) = lower(?)
+                LIMIT 1
+                """,
+                (current.id, candidate_display_name),
+            ).fetchone()
+            if duplicate_name_row is not None:
+                raise ValueError(
+                    f"An item named '{candidate_display_name}' already exists in the library tree"
+                )
+
             suffix = old_path.suffix if old_path.suffix else ".gpx"
             new_filename = _build_managed_filename(
                 desired_stem=cleaned_stem,
@@ -616,6 +848,7 @@ class LibraryStore:
                 file_hash=current.file_hash,
                 file_size=current.file_size,
                 duplicate_of_track_id=current.duplicate_of_track_id,
+                entry_kind=current.entry_kind,
             )
 
     def reverse_track(self, track_id: int) -> TrackRecord:
@@ -677,6 +910,7 @@ class LibraryStore:
                 file_hash=file_hash,
                 file_size=file_size,
                 duplicate_of_track_id=duplicate_of_track_id,
+                entry_kind=current.entry_kind,
             )
 
     def get_track_color(self, track_id: int) -> str | None:
@@ -748,6 +982,7 @@ class LibraryStore:
                 file_hash=file_hash,
                 file_size=file_size,
                 duplicate_of_track_id=duplicate_of_track_id,
+                entry_kind=current.entry_kind,
             )
 
     def trim_track(self, track_id: int, start_percent: float, end_percent: float) -> TrackRecord:
@@ -808,13 +1043,14 @@ class LibraryStore:
                 conn.execute(
                     """
                     INSERT INTO tracks(
-                        folder_id, display_name, managed_rel_path, original_source_path,
+                        folder_id, entry_kind, display_name, managed_rel_path, original_source_path,
                         file_hash, file_size, duplicate_of_track_id, metadata_json, imported_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         current.folder_id,
+                        "track",
                         trimmed_name,
                         str(trimmed_path.relative_to(self.library_root)),
                         current.original_source_path,
@@ -841,6 +1077,7 @@ class LibraryStore:
                 file_hash=file_hash,
                 file_size=file_size,
                 duplicate_of_track_id=duplicate_of_track_id,
+                entry_kind="track",
             )
 
     def split_track(self, track_id: int, split_percent: float) -> tuple[TrackRecord, TrackRecord]:
@@ -896,13 +1133,13 @@ class LibraryStore:
                 if kept_a < 2 or kept_b < 2:
                     raise ValueError("Split result must contain at least two points per output")
 
-                record_a = self._insert_track_from_managed_file(
+                record_a = self._insert_item_from_managed_file(
                     conn=conn,
                     folder_id=current.folder_id,
                     managed_path=split_a_path,
                     original_source_path=current.original_source_path,
                 )
-                record_b = self._insert_track_from_managed_file(
+                record_b = self._insert_item_from_managed_file(
                     conn=conn,
                     folder_id=current.folder_id,
                     managed_path=split_b_path,
@@ -973,7 +1210,7 @@ class LibraryStore:
                     raise ValueError("Merged track has too few points")
 
                 _replace_gpx_track_points(merged_path, merged_points)
-                return self._insert_track_from_managed_file(
+                return self._insert_item_from_managed_file(
                     conn=conn,
                     folder_id=primary.folder_id,
                     managed_path=merged_path,
@@ -1093,16 +1330,19 @@ class LibraryStore:
                 preview_path.unlink()
             raise
 
-    def _insert_track_from_managed_file(
+    def _insert_item_from_managed_file(
         self,
         conn: sqlite3.Connection,
         folder_id: int,
         managed_path: Path,
         original_source_path: str,
+        entry_kind: str = "track",
+        metadata_override: str | None = None,
+        display_name_override: str | None = None,
     ) -> TrackRecord:
         file_hash = _sha256(managed_path)
         file_size = managed_path.stat().st_size
-        metadata = _extract_basic_metadata(managed_path)
+        metadata = metadata_override if metadata_override is not None else _extract_basic_metadata(managed_path)
         now = _utc_now_iso()
 
         duplicate_row = conn.execute(
@@ -1114,14 +1354,15 @@ class LibraryStore:
         conn.execute(
             """
             INSERT INTO tracks(
-                folder_id, display_name, managed_rel_path, original_source_path,
+                folder_id, entry_kind, display_name, managed_rel_path, original_source_path,
                 file_hash, file_size, duplicate_of_track_id, metadata_json, imported_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 folder_id,
-                managed_path.name,
+                entry_kind,
+                display_name_override if display_name_override is not None else managed_path.name,
                 str(managed_path.relative_to(self.library_root)),
                 original_source_path,
                 file_hash,
@@ -1137,12 +1378,13 @@ class LibraryStore:
         return TrackRecord(
             id=track_id,
             folder_id=folder_id,
-            display_name=managed_path.name,
+            display_name=display_name_override if display_name_override is not None else managed_path.name,
             managed_rel_path=str(managed_path.relative_to(self.library_root)),
             original_source_path=original_source_path,
             file_hash=file_hash,
             file_size=file_size,
             duplicate_of_track_id=duplicate_of_track_id,
+            entry_kind=entry_kind,
         )
 
     def get_root_folder_id(self) -> int:
@@ -1225,6 +1467,10 @@ class LibraryStore:
 
 
 def _track_record_from_row(row: sqlite3.Row) -> TrackRecord:
+    entry_kind = "track"
+    if "entry_kind" in row.keys() and row["entry_kind"] is not None:
+        entry_kind = str(row["entry_kind"])
+
     return TrackRecord(
         id=int(row["id"]),
         folder_id=int(row["folder_id"]),
@@ -1238,6 +1484,7 @@ def _track_record_from_row(row: sqlite3.Row) -> TrackRecord:
             if row["duplicate_of_track_id"] is not None
             else None
         ),
+        entry_kind=entry_kind,
     )
 
 
@@ -1282,6 +1529,57 @@ def _build_managed_filename(
         if not exists(candidate):
             return candidate
         index += 1
+
+
+def _split_copy_suffix(name: str) -> tuple[str, int | None]:
+    match = COPY_SUFFIX_RE.match(name)
+    if match is None:
+        return name, None
+    return match.group(1), int(match.group(2))
+
+
+def _build_copy_track_display_name(
+    conn: sqlite3.Connection,
+    folder_id: int,
+    source_display_name: str,
+) -> str:
+    source_path = Path(source_display_name)
+    stem, number = _split_copy_suffix(source_path.stem)
+    base_stem = stem.strip() or source_path.stem
+    suffix = source_path.suffix
+
+    rows = conn.execute("SELECT display_name FROM tracks").fetchall()
+    existing = {str(row["display_name"]).lower() for row in rows}
+
+    start_number = 1 if number is None else number + 1
+    copy_number = start_number
+    while True:
+        candidate = f"{base_stem} ({copy_number}){suffix}"
+        if candidate.lower() not in existing:
+            return candidate
+        copy_number += 1
+
+
+def _build_copy_folder_name(conn: sqlite3.Connection, parent_id: int, source_name: str) -> str:
+    rows = conn.execute(
+        "SELECT name FROM folders WHERE parent_id = ?",
+        (parent_id,),
+    ).fetchall()
+    existing = {str(row["name"]).lower() for row in rows}
+
+    if source_name.lower() not in existing:
+        return source_name
+
+    stem, number = _split_copy_suffix(source_name)
+    base_name = stem.strip() or source_name
+
+    start_number = 1 if number is None else number + 1
+    copy_number = start_number
+    while True:
+        candidate = f"{base_name} ({copy_number})"
+        if candidate.lower() not in existing:
+            return candidate
+        copy_number += 1
 
 
 def _extract_basic_metadata(gpx_path: Path) -> str:
@@ -1517,9 +1815,10 @@ def _same_track_point(left: ET.Element, right: ET.Element) -> bool:
 class _TrackImportEntry:
     name: str | None
     gpx_bytes: bytes
+    entry_kind: str
 
 
-def _extract_gpx_track_entries(source_path: Path) -> list[_TrackImportEntry]:
+def _extract_gpx_import_entries(source_path: Path) -> list[_TrackImportEntry]:
     tree = ET.parse(source_path)
     root = tree.getroot()
 
@@ -1527,40 +1826,49 @@ def _extract_gpx_track_entries(source_path: Path) -> list[_TrackImportEntry]:
         namespace = root.tag.split("}", maxsplit=1)[0][1:]
         trk_path = f".//{{{namespace}}}trk"
         trk_name_tag = f"{{{namespace}}}name"
+        wpt_path = f".//{{{namespace}}}wpt"
+        wpt_name_tag = f"{{{namespace}}}name"
     else:
         namespace = None
         trk_path = ".//trk"
         trk_name_tag = "name"
+        wpt_path = ".//wpt"
+        wpt_name_tag = "name"
 
-    tracks = root.findall(trk_path)
     entries: list[_TrackImportEntry] = []
 
-    for track in tracks:
-        track_name_element = track.find(trk_name_tag)
-        track_name = None
-        if track_name_element is not None and track_name_element.text:
-            track_name = track_name_element.text.strip()
+    def add_entries(elements: list[ET.Element], name_tag: str, entry_kind: str) -> None:
+        for element in elements:
+            name_element = element.find(name_tag)
+            entry_name = None
+            if name_element is not None and name_element.text:
+                entry_name = name_element.text.strip()
 
-        cloned_root = copy.deepcopy(root)
-        cloned_tracks = cloned_root.findall(trk_path)
-        for cloned_track in cloned_tracks:
-            parent = _find_xml_parent(cloned_root, cloned_track)
-            if parent is None:
-                continue
-            parent.remove(cloned_track)
+            cloned_root = copy.deepcopy(root)
+            for cloned_track in cloned_root.findall(trk_path):
+                parent = _find_xml_parent(cloned_root, cloned_track)
+                if parent is not None:
+                    parent.remove(cloned_track)
 
-        target_parent = cloned_root
-        if namespace is not None:
-            for child in list(cloned_root):
-                if child.tag == f"{{{namespace}}}trk":
-                    target_parent = cloned_root
-                    break
+            for cloned_waypoint in cloned_root.findall(wpt_path):
+                parent = _find_xml_parent(cloned_root, cloned_waypoint)
+                if parent is not None:
+                    parent.remove(cloned_waypoint)
 
-        target_parent.append(copy.deepcopy(track))
+            cloned_root.append(copy.deepcopy(element))
 
-        buffer = BytesIO()
-        ET.ElementTree(cloned_root).write(buffer, encoding="utf-8", xml_declaration=True)
-        entries.append(_TrackImportEntry(name=track_name, gpx_bytes=buffer.getvalue()))
+            buffer = BytesIO()
+            ET.ElementTree(cloned_root).write(buffer, encoding="utf-8", xml_declaration=True)
+            entries.append(
+                _TrackImportEntry(
+                    name=entry_name,
+                    gpx_bytes=buffer.getvalue(),
+                    entry_kind=entry_kind,
+                )
+            )
+
+    add_entries(root.findall(trk_path), trk_name_tag, "track")
+    add_entries(root.findall(wpt_path), wpt_name_tag, "waypoint")
 
     return entries
 

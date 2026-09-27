@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import html
 import json
 import math
@@ -38,6 +39,10 @@ DEFAULT_DIRECTION_ARROW_COUNT = 10
 DEFAULT_DIRECTION_ARROW_SIZE_PX = 12
 DEFAULT_TRACK_POINT_COLOR = "#000000"
 DEFAULT_TRACK_POINT_SIZE_PX = 1
+TRACK_RENDER_MAX_POINTS = 3500
+PREVIEW_TOTAL_POINT_BUDGET = 7000
+PREVIEW_MIN_POINTS_PER_TRACK = 8
+PREVIEW_MAX_POINTS_PER_TRACK = 320
 
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 GPX_NS = "http://www.topografix.com/GPX/1/1"
@@ -148,6 +153,23 @@ class LeafletMapService:
         html=self._build_leaflet_html(payload, initial_overlays=initial_overlays),
       )
 
+    def render_waypoint(self, waypoint_path: Path, waypoint_name: str) -> RenderedMap:
+      """Render waypoint GPX as marker-only map."""
+      waypoints = _extract_gpx_waypoints(waypoint_path)
+      if not waypoints:
+        return RenderedMap(
+          title=waypoint_name,
+          html=self._build_message_html(
+            title="Waypoint has no coordinates",
+            message=f"No waypoint coordinates found in {waypoint_name}.",
+          ),
+        )
+
+      return RenderedMap(
+        title=waypoint_name,
+        html=self._build_waypoint_html(waypoints, waypoint_name),
+      )
+
     def render_track_lines_preview(
       self,
       tracks: list[
@@ -156,8 +178,14 @@ class LeafletMapService:
         | tuple[int, Path, str, str]
       ],
     ) -> RenderedMap:
-      """Render a lightweight overview of multiple tracks as simple faded lines."""
+      """Render a lightweight overview of multiple tracks and waypoints."""
+      track_count_estimate = max(1, len(tracks))
+      points_per_track = PREVIEW_TOTAL_POINT_BUDGET // track_count_estimate
+      points_per_track = max(PREVIEW_MIN_POINTS_PER_TRACK, points_per_track)
+      points_per_track = min(PREVIEW_MAX_POINTS_PER_TRACK, points_per_track)
+
       entries: list[dict[str, object]] = []
+      waypoints: list[dict[str, object]] = []
       for track_entry in tracks:
         if len(track_entry) == 4:
           track_id, track_path, track_name, hover_label = track_entry
@@ -169,8 +197,24 @@ class LeafletMapService:
           track_path, track_name = track_entry
           hover_label = track_name
 
-        coordinates = _extract_gpx_line_coordinates(track_path)
-        if len(coordinates) < 2:
+        try:
+          coordinates = _extract_gpx_line_coordinates(track_path)
+          if len(coordinates) < 2:
+            waypoint_points = _extract_gpx_waypoints(track_path)
+            for waypoint in waypoint_points:
+              waypoints.append(
+                {
+                  "trackId": track_id,
+                  "name": track_name,
+                  "hoverLabel": str(hover_label),
+                  "lat": waypoint["lat"],
+                  "lon": waypoint["lon"],
+                  "waypointName": waypoint.get("name") or track_name,
+                }
+              )
+            continue
+        except Exception:
+          # Keep overview usable even if one managed GPX file is malformed.
           continue
 
         track_color = _read_track_display_color(track_path) or self.default_track_color
@@ -180,20 +224,108 @@ class LeafletMapService:
             "trackId": track_id,
             "hoverLabel": str(hover_label),
             "trackColor": _lighten_hex_color(track_color, factor=self.preview_lightening_factor),
-            "coordinates": _downsample_coordinates(coordinates, max_points=1200),
+            "coordinates": _downsample_coordinates(coordinates, max_points=points_per_track),
           }
         )
 
-      if not entries:
+      if not entries and not waypoints:
         return self.render_placeholder(
           title="Map Preview",
-          message="No tracks in this folder view.",
+          message="No tracks or waypoints in this folder view.",
         )
 
       return RenderedMap(
         title="Track Overview",
-        html=self._build_track_lines_preview_html(entries),
+        html=self._build_track_lines_preview_html(entries, waypoints),
       )
+
+    def _build_waypoint_html(self, waypoints: list[dict[str, object]], title: str) -> str:
+        waypoints_json = json.dumps(waypoints)
+        waypoint_icon_url_json = json.dumps(_load_waypoint_icon_data_url())
+        safe_title = html.escape(title)
+        return f"""
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+    <link
+      rel=\"stylesheet\"
+      href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"
+      integrity=\"sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=\"
+      crossorigin=\"\"
+    />
+    <style>
+      html, body, #map {{ width: 100%; height: 100%; margin: 0; padding: 0; }}
+      .legend {{
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        top: 12px;
+        z-index: 1000;
+        background: rgba(255, 255, 255, 0.92);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-family: sans-serif;
+        font-size: 12px;
+        text-align: center;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+      }}
+    </style>
+  </head>
+  <body>
+    <div id=\"map\"></div>
+    <div class=\"legend\">{safe_title}</div>
+    <script
+      src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"
+      integrity=\"sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=\"
+      crossorigin=\"\"
+    ></script>
+    <script>
+      const waypoints = {waypoints_json};
+      const waypointIconUrl = {waypoint_icon_url_json};
+      const map = L.map("map");
+      L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors"
+      }}).addTo(map);
+      L.control.scale({{ imperial: false }}).addTo(map);
+
+      const group = L.featureGroup().addTo(map);
+      const waypointIcon = waypointIconUrl
+        ? L.icon({{
+            iconUrl: waypointIconUrl,
+            iconSize: [24, 24],
+            iconAnchor: [12, 24],
+            tooltipAnchor: [0, -22],
+          }})
+        : null;
+
+      waypoints.forEach((waypoint) => {{
+        const marker = waypointIcon
+          ? L.marker([waypoint.lat, waypoint.lon], {{ icon: waypointIcon }})
+          : L.circleMarker([waypoint.lat, waypoint.lon], {{
+              radius: 7,
+              color: "#B71C1C",
+              fillColor: "#E53935",
+              fillOpacity: 0.85,
+              weight: 2,
+            }});
+        marker.addTo(group);
+        marker.bindTooltip(waypoint.name || "Waypoint", {{ sticky: true }});
+      }});
+
+      window.__gpxFitTrack = function() {{
+        const bounds = group.getBounds();
+        if (bounds && bounds.isValid()) {{
+          map.fitBounds(bounds, {{ padding: [24, 24], maxZoom: 16 }});
+        }}
+      }};
+      window.__gpxFitTrack();
+    </script>
+  </body>
+</html>
+"""
 
     def render_tracks_with_overlays(
       self,
@@ -232,6 +364,8 @@ class LeafletMapService:
       if not points:
         return None
 
+      render_points = _downsample_track_points(points, max_points=TRACK_RENDER_MAX_POINTS)
+
       stats = analyzer.calculate_ride_stats(track_points=points)
       rest_stops = analyzer.find_rest_stops(
         track_points=points,
@@ -246,14 +380,14 @@ class LeafletMapService:
           "ele": point.elevation_m,
           "time": point.time.isoformat() if point.time is not None else None,
         }
-        for point in points
+        for point in render_points
       ]
 
       start = coordinates[0]
       end = coordinates[-1]
-      distance_markers = self._build_distance_markers(points, interval_km=10.0)
+      distance_markers = self._build_distance_markers(render_points, interval_km=10.0)
       direction_arrows = self._build_direction_arrows(
-          points,
+          render_points,
           arrow_count=self.direction_arrow_count,
       )
       total_distance_km = round(stats["total_distance_m"] / 1000.0, 2)
@@ -1033,8 +1167,14 @@ class LeafletMapService:
 </html>
 """
 
-    def _build_track_lines_preview_html(self, tracks: list[dict[str, object]]) -> str:
+    def _build_track_lines_preview_html(
+        self,
+        tracks: list[dict[str, object]],
+        waypoints: list[dict[str, object]],
+    ) -> str:
         tracks_json = json.dumps(tracks)
+        waypoints_json = json.dumps(waypoints)
+        waypoint_icon_url_json = json.dumps(_load_waypoint_icon_data_url())
         track_delete_operation = "delete_permanently" if self.track_delete_uses_permanent else "move_to_trash"
         track_delete_label = "Delete permanently" if self.track_delete_uses_permanent else "Move to Trash"
         return f"""
@@ -1100,7 +1240,7 @@ class LeafletMapService:
       <button data-op=\"reverse\">Reverse</button>
       <button data-op=\"export\">Export GPX</button>
       <button data-op=\"set_color\">Set color</button>
-      <button data-op="{track_delete_operation}">{track_delete_label}</button>
+      <button data-op=\"{track_delete_operation}\">{track_delete_label}</button>
     </div>
     <script
       src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"
@@ -1109,14 +1249,24 @@ class LeafletMapService:
     ></script>
     <script>
       const tracks = {tracks_json};
-      const map = L.map(\"map\");
-      L.tileLayer(\"https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png\", {{
+      const waypoints = {waypoints_json};
+      const waypointIconUrl = {waypoint_icon_url_json};
+      const map = L.map("map");
+      L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
         maxZoom: 19,
-        attribution: \"&copy; OpenStreetMap contributors\"
+        attribution: "&copy; OpenStreetMap contributors"
       }}).addTo(map);
       L.control.scale({{ imperial: false }}).addTo(map);
 
       const group = L.featureGroup().addTo(map);
+      const waypointIcon = waypointIconUrl
+        ? L.icon({{
+            iconUrl: waypointIconUrl,
+            iconSize: [24, 24],
+            iconAnchor: [12, 24],
+            tooltipAnchor: [0, -22],
+          }})
+        : null;
       const trackMenu = document.getElementById("track-menu");
       let contextTrackId = null;
 
@@ -1173,6 +1323,30 @@ class LeafletMapService:
         }});
       }});
 
+      waypoints.forEach((waypoint) => {{
+        const marker = waypointIcon
+          ? L.marker([waypoint.lat, waypoint.lon], {{ icon: waypointIcon }})
+          : L.circleMarker([waypoint.lat, waypoint.lon], {{
+              radius: 6,
+              color: "#B71C1C",
+              fillColor: "#E53935",
+              fillOpacity: 0.85,
+              weight: 2,
+            }});
+        marker.addTo(group);
+
+        marker.bindTooltip(waypoint.waypointName || waypoint.hoverLabel || "Waypoint", {{
+          sticky: true,
+          direction: "top",
+          opacity: 0.95,
+        }});
+
+        marker.on("click", () => {{
+          trackMenu.style.display = "none";
+          openTrackById(waypoint.trackId);
+        }});
+      }});
+
       map.on("click", () => {{
         trackMenu.style.display = "none";
       }});
@@ -1195,8 +1369,8 @@ class LeafletMapService:
       }};
       window.__gpxFitTrack();
 
-      document.getElementById(\"overview-title\").textContent =
-        `${{tracks.length}} track(s) in current folder view`;
+      document.getElementById("overview-title").textContent =
+        `${{tracks.length}} track(s), ${{waypoints.length}} waypoint(s) in current folder view`;
     </script>
   </body>
 </html>
@@ -1816,6 +1990,61 @@ def _extract_gpx_line_coordinates(track_path: Path) -> list[dict[str, float]]:
     return coordinates
 
 
+def _extract_gpx_waypoints(track_path: Path) -> list[dict[str, object]]:
+    root = ET.parse(track_path).getroot()
+    waypoints: list[dict[str, object]] = []
+
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", maxsplit=1)[0][1:]
+        wpt_path = f".//{{{namespace}}}wpt"
+        name_tag = f"{{{namespace}}}name"
+    else:
+        wpt_path = ".//wpt"
+        name_tag = "name"
+
+    for waypoint in root.findall(wpt_path):
+        lat_text = waypoint.get("lat")
+        lon_text = waypoint.get("lon")
+        if lat_text is None or lon_text is None:
+            continue
+        try:
+            lat = float(lat_text)
+            lon = float(lon_text)
+        except ValueError:
+            continue
+
+        name = None
+        name_node = waypoint.find(name_tag)
+        if name_node is not None and name_node.text:
+            name = name_node.text.strip()
+
+        waypoints.append(
+            {
+                "lat": lat,
+                "lon": lon,
+                "name": name,
+            }
+        )
+
+    return waypoints
+
+
+def _load_waypoint_icon_data_url() -> str | None:
+    icon_paths = [
+        Path.cwd() / "gpx_organizer" / "icons" / "map-waypoint.png",
+        Path.cwd() / "icons" / "map-waypoint.png",
+    ]
+    for icon_path in icon_paths:
+        if not icon_path.is_file():
+            continue
+        try:
+            encoded = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+        except Exception:
+            continue
+    return None
+
+
 def _downsample_coordinates(
     coordinates: list[dict[str, float]],
     max_points: int,
@@ -1832,5 +2061,25 @@ def _downsample_coordinates(
         src_index = int(round(index * step))
         src_index = max(0, min(len(coordinates) - 1, src_index))
         sampled.append(coordinates[src_index])
+
+    return sampled
+
+
+def _downsample_track_points(
+    points: list[TrackPoint],
+    max_points: int,
+) -> list[TrackPoint]:
+    if len(points) <= max_points:
+        return points
+
+    if max_points < 2:
+        return [points[0], points[-1]]
+
+    step = (len(points) - 1) / float(max_points - 1)
+    sampled: list[TrackPoint] = []
+    for index in range(max_points):
+        src_index = int(round(index * step))
+        src_index = max(0, min(len(points) - 1, src_index))
+        sampled.append(points[src_index])
 
     return sampled

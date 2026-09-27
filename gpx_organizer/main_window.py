@@ -9,8 +9,10 @@ from urllib.parse import parse_qs
 import webbrowser
 
 from .qt_compat import (
+    QApplication,
     QT_BINDING,
     QCheckBox,
+    QColor,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -23,6 +25,7 @@ from .qt_compat import (
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
+    QIcon,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -32,10 +35,14 @@ from .qt_compat import (
     QMessageBox,
     QMimeData,
     QPoint,
+    QPainter,
+    QPixmap,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QStyle,
     QTabWidget,
     QTimer,
     QTreeWidget,
@@ -71,9 +78,16 @@ from .settings_store import (
     get_map_track_point_color,
     get_map_track_point_size_px,
     get_window_folder_tree_expanded_ids,
+    get_window_drag_preview_opacity_percent,
+    get_window_import_progress_min_gpx_files,
     get_window_keep_configuration_enabled,
     get_window_keep_folder_tree_structure_enabled,
     get_window_keep_last_track_shown_enabled,
+    get_window_subfolder_separator_color,
+    get_window_subfolder_separator_opacity_percent,
+    get_window_library_splitter_sizes,
+    get_window_last_folder_id,
+    get_window_tracks_first_then_waypoints_enabled,
     get_window_last_track_id,
     get_window_preview_folder_track_list_enabled,
     get_window_size,
@@ -99,9 +113,16 @@ from .settings_store import (
     set_map_track_point_color,
     set_map_track_point_size_px,
     set_window_folder_tree_expanded_ids,
+    set_window_drag_preview_opacity_percent,
+    set_window_import_progress_min_gpx_files,
     set_window_keep_configuration_enabled,
     set_window_keep_folder_tree_structure_enabled,
     set_window_keep_last_track_shown_enabled,
+    set_window_subfolder_separator_color,
+    set_window_subfolder_separator_opacity_percent,
+    set_window_library_splitter_sizes,
+    set_window_last_folder_id,
+    set_window_tracks_first_then_waypoints_enabled,
     set_window_last_track_id,
     set_window_preview_folder_track_list_enabled,
     set_window_size,
@@ -110,9 +131,16 @@ from .settings_store import (
 
 
 TRACK_IDS_MIME = "application/x-gpx-track-ids"
+TRACK_DRAG_SOURCE_FOLDER_ID_MIME = "application/x-gpx-track-drag-source-folder-id"
+FOLDER_ID_MIME = "application/x-gpx-folder-id"
 FOLDER_ID_ROLE = Qt.ItemDataRole.UserRole
 FOLDER_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 TRACK_ID_ROLE = Qt.ItemDataRole.UserRole
+TRACK_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
+# Keep this conservative: QWebEngine setHtml internally uses a data URL and
+# can silently fail once encoded payloads get large. Folder overviews with many
+# tracks can hit this sooner than expected.
+WEBENGINE_SETHTML_MAX_CHARS = 240_000
 
 
 @dataclass
@@ -129,29 +157,272 @@ class _FolderPreviewCacheEntry:
     dirty: bool = False
 
 
+@dataclass(frozen=True)
+class _ClipboardPayload:
+    kind: str  # "items" or "folder"
+    item_ids: tuple[int, ...] = ()
+    folder_id: int | None = None
+    operation: str = "copy"  # "copy" or "cut"
+
+
 class FolderTreeWidget(QTreeWidget):
     """Folder tree supporting both internal and external drag-and-drop."""
 
     folder_move_requested = Signal(int, int)
-    track_drop_requested = Signal(list, int)
+    folder_copy_requested = Signal(int, int)
+    track_drop_requested = Signal(list, int, str)
     gpx_files_dropped = Signal(list, int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._drop_hover_item: QTreeWidgetItem | None = None
+        self._drop_hover_item_was_bold = False
+        self._folder_closed_icon = QIcon()
+        self._folder_open_icon = QIcon()
+        self._folder_selected_icon = QIcon()
+        self._folder_hover_icon = QIcon()
+        self._drag_preview_opacity = 0.9
+
+    def set_drag_preview_opacity(self, opacity: float) -> None:
+        self._drag_preview_opacity = max(0.1, min(1.0, float(opacity)))
+
+    def set_folder_icons(
+        self,
+        *,
+        closed_icon: QIcon,
+        open_icon: QIcon,
+        selected_icon: QIcon,
+        hover_icon: QIcon,
+    ) -> None:
+        self._folder_closed_icon = closed_icon
+        self._folder_open_icon = open_icon
+        self._folder_selected_icon = selected_icon
+        self._folder_hover_icon = hover_icon
+
+    def drop_hover_item(self) -> QTreeWidgetItem | None:
+        return self._drop_hover_item
+
+    def _icon_is_renderable(self, icon: QIcon) -> bool:
+        return not icon.isNull()
+
+    def _preferred_icon_for_item(self, item: QTreeWidgetItem) -> QIcon:
+        if item is self._drop_hover_item and self._icon_is_renderable(self._folder_hover_icon):
+            return self._folder_hover_icon
+        if item is self.currentItem() and self._icon_is_renderable(self._folder_selected_icon):
+            return self._folder_selected_icon
+        if item.isExpanded():
+            return self._folder_open_icon
+        return self._folder_closed_icon
+
+    def _apply_folder_icon(self, item: QTreeWidgetItem | None) -> None:
+        if item is None:
+            return
+        item.setIcon(0, self._preferred_icon_for_item(item))
+
+    def _build_drag_pixmap(self, item: QTreeWidgetItem) -> tuple[QPixmap, QPoint] | None:
+        text = item.text(0)
+        icon = item.icon(0)
+        metrics = self.fontMetrics()
+        icon_extent = max(16, self.iconSize().height())
+        text_width = max(1, metrics.horizontalAdvance(text))
+        text_height = metrics.height()
+        gap = 6
+        pad_x = 6
+        pad_y = 4
+        width = (pad_x * 2) + icon_extent + gap + text_width
+        height = (pad_y * 2) + max(icon_extent, text_height)
+
+        pixmap = QPixmap(width, height)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        try:
+            painter.setOpacity(self._drag_preview_opacity)
+            if not icon.isNull():
+                icon.paint(
+                    painter,
+                    pad_x,
+                    (height - icon_extent) // 2,
+                    icon_extent,
+                    icon_extent,
+                )
+
+            text_x = pad_x + icon_extent + gap
+            text_y = (height + metrics.ascent() - metrics.descent()) // 2
+            painter.drawText(text_x, text_y, text)
+        finally:
+            painter.end()
+
+        hotspot = QPoint(min(12, max(0, width - 1)), height // 2)
+        return pixmap, hotspot
+
+    def _set_drop_hover_item(self, item: QTreeWidgetItem | None) -> None:
+        if self._drop_hover_item is item:
+            return
+
+        previous_item = self._drop_hover_item
+        previous_item_was_bold = self._drop_hover_item_was_bold
+        self._drop_hover_item = None
+        self._drop_hover_item_was_bold = False
+
+        if previous_item is not None:
+            previous_font = previous_item.font(0)
+            previous_font.setBold(previous_item_was_bold)
+            previous_item.setFont(0, previous_font)
+            self._apply_folder_icon(previous_item)
+
+        self._drop_hover_item = item
+
+        if item is not None:
+            hover_font = item.font(0)
+            self._drop_hover_item_was_bold = hover_font.bold()
+            hover_font.setBold(True)
+            item.setFont(0, hover_font)
+            self._apply_folder_icon(item)
 
     def dragEnterEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
+        if event.mimeData().hasFormat(TRACK_IDS_MIME) or event.mimeData().hasFormat(FOLDER_ID_MIME):
+            event.accept()
+            return
         super().dragEnterEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self._set_drop_hover_item(None)
+        self.unsetCursor()
+        super().dragLeaveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self._set_drop_hover_item(None)
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item is not None and (item.flags() & Qt.ItemFlag.ItemIsDragEnabled):
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self._set_drop_hover_item(None)
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    def startDrag(self, supported_actions) -> None:  # pragma: no cover - GUI behavior
+        moving_item = self.currentItem()
+        if moving_item is None:
+            return
+
+        moving_folder_id = moving_item.data(0, FOLDER_ID_ROLE)
+        if moving_folder_id is None:
+            return
+
+        mime_data = QMimeData()
+        mime_data.setData(FOLDER_ID_MIME, str(int(moving_folder_id)).encode("utf-8"))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag_pixmap = self._build_drag_pixmap(moving_item)
+        if drag_pixmap is not None:
+            pixmap, hotspot = drag_pixmap
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(hotspot)
+        default_action = (
+            Qt.DropAction.CopyAction
+            if (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+            else Qt.DropAction.MoveAction
+        )
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        try:
+            drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, default_action)
+        finally:
+            self.unsetCursor()
 
     def dragMoveEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         if event.mimeData().hasUrls():
+            self._set_drop_hover_item(self.itemAt(event.position().toPoint()))
             event.acceptProposedAction()
             return
         if event.mimeData().hasFormat(TRACK_IDS_MIME):
-            event.acceptProposedAction()
+            target_item = self.itemAt(event.position().toPoint())
+            if target_item is None:
+                self._set_drop_hover_item(None)
+                event.ignore()
+                return
+
+            self._set_drop_hover_item(target_item)
+
+            target_folder_id = target_item.data(0, FOLDER_ID_ROLE)
+            if target_folder_id is None:
+                self._set_drop_hover_item(None)
+                event.ignore()
+                return
+
+            source_folder_id = None
+            if event.mimeData().hasFormat(TRACK_DRAG_SOURCE_FOLDER_ID_MIME):
+                source_raw = bytes(event.mimeData().data(TRACK_DRAG_SOURCE_FOLDER_ID_MIME)).decode("utf-8")
+                try:
+                    source_folder_id = int(source_raw)
+                except ValueError:
+                    source_folder_id = None
+
+            if source_folder_id is not None and int(target_folder_id) == source_folder_id:
+                event.setDropAction(Qt.DropAction.IgnoreAction)
+                event.ignore()
+                return
+
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            else:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
             return
+
+        if event.mimeData().hasFormat(FOLDER_ID_MIME):
+            target_item = self.itemAt(event.position().toPoint())
+            if target_item is None:
+                self._set_drop_hover_item(None)
+                event.ignore()
+                return
+
+            self._set_drop_hover_item(target_item)
+
+            target_folder_id = target_item.data(0, FOLDER_ID_ROLE)
+            if target_folder_id is None:
+                self._set_drop_hover_item(None)
+                event.ignore()
+                return
+
+            source_raw = bytes(event.mimeData().data(FOLDER_ID_MIME)).decode("utf-8")
+            try:
+                moving_folder_id = int(source_raw)
+            except ValueError:
+                event.ignore()
+                return
+
+            if int(target_folder_id) == moving_folder_id:
+                event.setDropAction(Qt.DropAction.IgnoreAction)
+                event.ignore()
+                return
+
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            else:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+
+        self._set_drop_hover_item(None)
         super().dragMoveEvent(event)
 
     def dropEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self._set_drop_hover_item(None)
+        self.unsetCursor()
         if event.mimeData().hasUrls():
             target_item = self.itemAt(event.position().toPoint())
             if target_item is None:
@@ -190,55 +461,140 @@ class FolderTreeWidget(QTreeWidget):
                 event.ignore()
                 return
 
+            source_folder_id = None
+            if event.mimeData().hasFormat(TRACK_DRAG_SOURCE_FOLDER_ID_MIME):
+                source_raw = bytes(event.mimeData().data(TRACK_DRAG_SOURCE_FOLDER_ID_MIME)).decode("utf-8")
+                try:
+                    source_folder_id = int(source_raw)
+                except ValueError:
+                    source_folder_id = None
+
+            if source_folder_id is not None and int(target_folder_id) == source_folder_id:
+                event.setDropAction(Qt.DropAction.IgnoreAction)
+                event.ignore()
+                return
+
             raw_ids = bytes(event.mimeData().data(TRACK_IDS_MIME)).decode("utf-8")
             track_ids = [int(value) for value in raw_ids.split(",") if value.strip()]
             if not track_ids:
                 event.ignore()
                 return
 
-            self.track_drop_requested.emit(track_ids, int(target_folder_id))
-            event.acceptProposedAction()
+            operation = (
+                "copy"
+                if (
+                    event.dropAction() == Qt.DropAction.CopyAction
+                    or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+                )
+                else "move"
+            )
+            self.track_drop_requested.emit(track_ids, int(target_folder_id), operation)
+            event.accept()
             return
 
-        moving_item = self.currentItem()
-        moving_folder_id = None
-        old_parent_id = None
-        if moving_item is not None:
-            folder_id = moving_item.data(0, FOLDER_ID_ROLE)
-            if folder_id is not None:
-                moving_folder_id = int(folder_id)
+        if event.mimeData().hasFormat(FOLDER_ID_MIME):
+            if target_item is None:
+                event.ignore()
+                return
 
-            parent_item = moving_item.parent()
-            if parent_item is not None:
-                parent_id = parent_item.data(0, FOLDER_ID_ROLE)
-                if parent_id is not None:
-                    old_parent_id = int(parent_id)
+            target_folder_id = target_item.data(0, FOLDER_ID_ROLE)
+            if target_folder_id is None:
+                event.ignore()
+                return
+
+            source_raw = bytes(event.mimeData().data(FOLDER_ID_MIME)).decode("utf-8")
+            try:
+                moving_folder_id = int(source_raw)
+            except ValueError:
+                event.ignore()
+                return
+
+            if int(target_folder_id) == moving_folder_id:
+                event.setDropAction(Qt.DropAction.IgnoreAction)
+                event.ignore()
+                return
+
+            operation = (
+                "copy"
+                if (
+                    event.dropAction() == Qt.DropAction.CopyAction
+                    or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+                )
+                else "move"
+            )
+            if operation == "copy":
+                self.folder_copy_requested.emit(moving_folder_id, int(target_folder_id))
+            else:
+                self.folder_move_requested.emit(moving_folder_id, int(target_folder_id))
+            event.accept()
+            return
 
         super().dropEvent(event)
-
-        if moving_folder_id is None:
-            return
-
-        moved_item = self.currentItem() or moving_item
-        if moved_item is None:
-            return
-
-        new_parent_item = moved_item.parent()
-        if new_parent_item is None:
-            return
-
-        new_parent_id = new_parent_item.data(0, FOLDER_ID_ROLE)
-        if new_parent_id is None:
-            return
-
-        if old_parent_id == int(new_parent_id):
-            return
-
-        self.folder_move_requested.emit(moving_folder_id, int(new_parent_id))
 
 
 class TrackListWidget(QListWidget):
     """Track list that drags selected track IDs as custom mime payload."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._drag_preview_opacity = 0.9
+
+    def set_drag_preview_opacity(self, opacity: float) -> None:
+        self._drag_preview_opacity = max(0.1, min(1.0, float(opacity)))
+
+    def _build_drag_pixmap(self) -> tuple[QPixmap, QPoint] | None:
+        item = self.currentItem()
+        if item is None and self.selectedItems():
+            item = self.selectedItems()[0]
+        if item is None:
+            return None
+
+        text = item.text()
+        icon = item.icon()
+        metrics = self.fontMetrics()
+        icon_extent = max(16, self.iconSize().height())
+        text_width = max(1, metrics.horizontalAdvance(text))
+        text_height = metrics.height()
+        gap = 6
+        pad_x = 6
+        pad_y = 4
+        width = (pad_x * 2) + icon_extent + gap + text_width
+        height = (pad_y * 2) + max(icon_extent, text_height)
+
+        pixmap = QPixmap(width, height)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        try:
+            painter.setOpacity(self._drag_preview_opacity)
+            if not icon.isNull():
+                icon.paint(
+                    painter,
+                    pad_x,
+                    (height - icon_extent) // 2,
+                    icon_extent,
+                    icon_extent,
+                )
+
+            text_x = pad_x + icon_extent + gap
+            text_y = (height + metrics.ascent() - metrics.descent()) // 2
+            painter.drawText(text_x, text_y, text)
+        finally:
+            painter.end()
+
+        hotspot = QPoint(min(12, max(0, width - 1)), height // 2)
+        return pixmap, hotspot
+
+    def mousePressEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item is not None and item.data(TRACK_ID_ROLE) is not None:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
 
     def startDrag(self, supported_actions) -> None:  # pragma: no cover - GUI behavior
         selected_ids: list[int] = []
@@ -254,9 +610,30 @@ class TrackListWidget(QListWidget):
         payload = ",".join(str(track_id) for track_id in selected_ids)
         mime_data.setData(TRACK_IDS_MIME, payload.encode("utf-8"))
 
+        source_folder_id = self.property("source_folder_id")
+        if source_folder_id is not None:
+            mime_data.setData(
+                TRACK_DRAG_SOURCE_FOLDER_ID_MIME,
+                str(int(source_folder_id)).encode("utf-8"),
+            )
+
         drag = QDrag(self)
         drag.setMimeData(mime_data)
-        drag.exec(Qt.DropAction.MoveAction)
+        drag_pixmap = self._build_drag_pixmap()
+        if drag_pixmap is not None:
+            pixmap, hotspot = drag_pixmap
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(hotspot)
+        default_action = (
+            Qt.DropAction.CopyAction
+            if (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+            else Qt.DropAction.MoveAction
+        )
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        try:
+            drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, default_action)
+        finally:
+            self.unsetCursor()
 
 
 class PreferencesDialog(QDialog):
@@ -265,12 +642,17 @@ class PreferencesDialog(QDialog):
     def __init__(
         self,
         library_root_path: str,
+        drag_preview_opacity_percent: int,
+        import_progress_min_gpx_files: int,
+        subfolder_separator_color: str,
+        subfolder_separator_opacity_percent: int,
         current_threshold_px: int,
         preview_folder_track_list: bool,
         preview_lightening_factor: float,
         keep_window_configuration: bool,
         keep_folder_tree_structure: bool,
         keep_last_track_shown: bool,
+        tracks_first_then_waypoints: bool,
         rest_stop_color: str,
         rest_stop_size_px: int,
         default_track_color: str,
@@ -309,6 +691,36 @@ class PreferencesDialog(QDialog):
         library_layout.addWidget(self._library_root_path_edit)
         library_layout.addWidget(browse_button)
         general_form.addRow("Track Library Path:", library_row)
+
+        self._drag_preview_opacity_spin = QSpinBox(general_tab)
+        self._drag_preview_opacity_spin.setRange(10, 100)
+        self._drag_preview_opacity_spin.setSingleStep(1)
+        self._drag_preview_opacity_spin.setSuffix(" %")
+        self._drag_preview_opacity_spin.setValue(drag_preview_opacity_percent)
+        general_form.addRow("Drag preview opacity:", self._drag_preview_opacity_spin)
+
+        self._import_progress_min_gpx_files_spin = QSpinBox(general_tab)
+        self._import_progress_min_gpx_files_spin.setRange(0, 100000)
+        self._import_progress_min_gpx_files_spin.setSingleStep(1)
+        self._import_progress_min_gpx_files_spin.setValue(import_progress_min_gpx_files)
+        general_form.addRow(
+            "Show import progress when GPX files >",
+            self._import_progress_min_gpx_files_spin,
+        )
+
+        self._subfolder_separator_color_button = QPushButton(subfolder_separator_color, general_tab)
+        self._subfolder_separator_color_button.clicked.connect(
+            lambda: self._pick_color(self._subfolder_separator_color_button)
+        )
+        self._apply_color_button_style(self._subfolder_separator_color_button)
+        general_form.addRow("Subfolder separator color:", self._subfolder_separator_color_button)
+
+        self._subfolder_separator_opacity_spin = QSpinBox(general_tab)
+        self._subfolder_separator_opacity_spin.setRange(10, 100)
+        self._subfolder_separator_opacity_spin.setSingleStep(1)
+        self._subfolder_separator_opacity_spin.setSuffix(" %")
+        self._subfolder_separator_opacity_spin.setValue(subfolder_separator_opacity_percent)
+        general_form.addRow("Subfolder separator opacity:", self._subfolder_separator_opacity_spin)
         tabs.addTab(general_tab, "General")
 
         window_tab = QWidget(self)
@@ -343,6 +755,16 @@ class PreferencesDialog(QDialog):
         self._keep_last_track_shown_checkbox = QCheckBox("Restore last shown track", window_tab)
         self._keep_last_track_shown_checkbox.setChecked(keep_last_track_shown)
         window_form.addRow("Keep last track shown:", self._keep_last_track_shown_checkbox)
+
+        self._tracks_first_then_waypoints_checkbox = QCheckBox(
+            "List tracks first, then waypoints",
+            window_tab,
+        )
+        self._tracks_first_then_waypoints_checkbox.setChecked(tracks_first_then_waypoints)
+        window_form.addRow(
+            "Tracks & Waypoints order:",
+            self._tracks_first_then_waypoints_checkbox,
+        )
         tabs.addTab(window_tab, "Window")
 
         track_tab = QWidget(self)
@@ -531,6 +953,18 @@ class PreferencesDialog(QDialog):
     def selected_map_threshold_px(self) -> int:
         return int(self._map_threshold_spin.value())
 
+    def selected_drag_preview_opacity_percent(self) -> int:
+        return int(self._drag_preview_opacity_spin.value())
+
+    def selected_import_progress_min_gpx_files(self) -> int:
+        return int(self._import_progress_min_gpx_files_spin.value())
+
+    def selected_subfolder_separator_color(self) -> str:
+        return self._subfolder_separator_color_button.text()
+
+    def selected_subfolder_separator_opacity_percent(self) -> int:
+        return int(self._subfolder_separator_opacity_spin.value())
+
     def selected_preview_folder_track_list_enabled(self) -> bool:
         return self._preview_folder_track_list_checkbox.isChecked()
 
@@ -545,6 +979,9 @@ class PreferencesDialog(QDialog):
 
     def selected_keep_last_track_shown_enabled(self) -> bool:
         return self._keep_last_track_shown_checkbox.isChecked()
+
+    def selected_tracks_first_then_waypoints_enabled(self) -> bool:
+        return self._tracks_first_then_waypoints_checkbox.isChecked()
 
     def selected_rest_stop_color(self) -> str:
         return self._rest_stop_color_button.text()
@@ -686,6 +1123,7 @@ class MainWindow(QMainWindow):
         self._map_panel_container: QWidget | None = None
         self._map_toolbar: QWidget | None = None
         self._main_splitter: QSplitter | None = None
+        self._library_splitter: QSplitter | None = None
         self._current_map_html: str = ""
         self._pending_trim_start_percent: float | None = None
         self._map_hide_timer = QTimer(self)
@@ -702,20 +1140,51 @@ class MainWindow(QMainWindow):
         self._visible_tracks: list[TrackRecord] = []
         self._preview_cache: dict[int, _FolderPreviewCacheEntry] = {}
         self._preview_cache_queue: set[int] = set()
+        self._folder_closed_icon = QIcon()
+        self._folder_open_icon = QIcon()
+        self._folder_selected_icon = QIcon()
+        self._folder_hover_icon = QIcon()
+        self._track_item_icon = QIcon()
+        self._waypoint_item_icon = QIcon()
+        self._clipboard_payload: _ClipboardPayload | None = None
+        self._clipboard_consumed: bool = False
         self._folder_parent_by_id: dict[int, int | None] = {}
         self._folder_kind_by_id: dict[int, str] = {}
         self._folder_ids: set[int] = set()
         self._expanded_folder_ids: set[int] = set(get_window_folder_tree_expanded_ids())
+        self._drag_preview_opacity_percent = get_window_drag_preview_opacity_percent()
+        self._import_progress_min_gpx_files = get_window_import_progress_min_gpx_files()
+        self._subfolder_separator_color = get_window_subfolder_separator_color()
+        self._subfolder_separator_opacity_percent = get_window_subfolder_separator_opacity_percent()
         self._preview_folder_track_list_enabled = get_window_preview_folder_track_list_enabled()
         self._keep_window_configuration_enabled = get_window_keep_configuration_enabled()
         self._keep_folder_tree_structure_enabled = get_window_keep_folder_tree_structure_enabled()
         self._keep_last_track_shown_enabled = get_window_keep_last_track_shown_enabled()
+        self._tracks_first_then_waypoints_enabled = (
+            get_window_tracks_first_then_waypoints_enabled()
+        )
         self._last_track_id_to_restore: int | None = (
             get_window_last_track_id() if self._keep_last_track_shown_enabled else None
         )
+        self._last_folder_id_to_restore: int | None = (
+            get_window_last_folder_id() if self._keep_last_track_shown_enabled else None
+        )
+        self._track_list_counts_label: QLabel | None = None
         self._preview_cache_timer = QTimer(self)
         self._preview_cache_timer.setSingleShot(True)
         self._preview_cache_timer.timeout.connect(self._process_preview_cache_queue)
+        self._preview_prepare_placeholder_timer = QTimer(self)
+        self._preview_prepare_placeholder_timer.setSingleShot(True)
+        self._preview_prepare_placeholder_timer.timeout.connect(
+            self._show_pending_folder_preview_placeholder
+        )
+        self._pending_folder_preview_id: int | None = None
+        self._suppress_folder_overview_once = False
+        self._restoring_persisted_folder_selection = False
+        self._interaction_idle_timer = QTimer(self)
+        self._interaction_idle_timer.setSingleShot(True)
+        self._interaction_idle_timer.timeout.connect(self._resume_deferred_preview_rebuilds)
+        self._defer_preview_rebuilds = False
         self._map_overlay_state: dict[str, bool] = {
             "gradient": True,
             "points": False,
@@ -732,11 +1201,12 @@ class MainWindow(QMainWindow):
         else:
             self.resize(1400, 840)
         self.setAcceptDrops(True)
+        self._load_ui_icons()
         self._init_menu()
         self._init_body()
         self._init_status_bar()
         self._load_library_tree()
-        self._restore_last_track_if_needed()
+        QTimer.singleShot(0, self._restore_last_track_if_needed)
 
     def _init_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -749,6 +1219,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._import_action = file_menu.addAction("Import GPX")
         self._import_action.triggered.connect(self._import_gpx_into_selected_folder)
+        import_folder_tree_action = file_menu.addAction("Import Folder Tree...")
+        import_folder_tree_action.triggered.connect(self._import_folder_tree_into_library)
         export_action = file_menu.addAction("Export GPX")
         export_action.triggered.connect(self._export_selected_track)
         file_menu.addSeparator()
@@ -756,14 +1228,28 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
 
         edit_menu = menu_bar.addMenu("Edit")
+        cut_action = edit_menu.addAction("Cut")
+        cut_action.setShortcut("Ctrl+X")
+        cut_action.triggered.connect(self._cut_selected_item)
+        copy_action = edit_menu.addAction("Copy")
+        copy_action.setShortcut("Ctrl+C")
+        copy_action.triggered.connect(self._copy_selected_item)
+        paste_action = edit_menu.addAction("Paste")
+        paste_action.setShortcut("Ctrl+V")
+        paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
+        edit_menu.addSeparator()
         rename_action = edit_menu.addAction("Rename")
+        rename_action.setShortcut("F2")
         rename_action.triggered.connect(self._rename_selected_item)
         delete_action = edit_menu.addAction("Delete")
+        delete_action.setShortcut("Delete")
         delete_action.triggered.connect(self._delete_selected_item)
         edit_menu.addSeparator()
         self._undo_action = edit_menu.addAction("Undo")
+        self._undo_action.setShortcut("Ctrl+Z")
         self._undo_action.triggered.connect(self._undo_last_edit)
         self._redo_action = edit_menu.addAction("Redo")
+        self._redo_action.setShortcut("Ctrl+Y")
         self._redo_action.triggered.connect(self._redo_last_edit)
 
         track_menu = menu_bar.addMenu("Track")
@@ -795,8 +1281,8 @@ class MainWindow(QMainWindow):
         self._main_splitter = splitter
         splitter.setChildrenCollapsible(False)
 
-        tree_panel = self._build_tree_panel()
-        list_panel = self._build_track_list_panel()
+        tree_panel = self._build_library_panel()
+        list_panel = self._build_tracks_analysis_panel()
         map_panel = self._build_map_panel()
 
         splitter.addWidget(tree_panel)
@@ -813,7 +1299,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(splitter)
 
-    def _build_tree_panel(self) -> QWidget:
+    def _build_library_panel(self) -> QWidget:
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -821,47 +1307,200 @@ class MainWindow(QMainWindow):
         title = QLabel("Library Tree", container)
         title.setObjectName("panelTitle")
 
+        library_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._library_splitter = library_splitter
+        library_splitter.setChildrenCollapsible(False)
+
+        folders_panel = QWidget(container)
+        folders_layout = QVBoxLayout(folders_panel)
+        folders_layout.setContentsMargins(0, 0, 0, 0)
+        folders_layout.setSpacing(6)
+
         tree = FolderTreeWidget(container)
         tree.setHeaderLabel("Folders")
         tree.setDragEnabled(True)
         tree.setAcceptDrops(True)
-        tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
+        tree.setDragDropMode(QTreeWidget.DragDropMode.DragDrop)
         tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         tree.customContextMenuRequested.connect(self._show_tree_context_menu)
-        tree.itemSelectionChanged.connect(self._reload_track_list)
+        tree.currentItemChanged.connect(self._handle_current_folder_changed)
         tree.itemExpanded.connect(self._handle_tree_item_expanded)
         tree.itemCollapsed.connect(self._handle_tree_item_collapsed)
         tree.folder_move_requested.connect(self._move_folder_persisted)
+        tree.folder_copy_requested.connect(self._copy_folder_subtree_persisted)
         tree.track_drop_requested.connect(self._move_tracks_to_folder)
         tree.gpx_files_dropped.connect(self._import_dropped_paths)
+        tree.set_folder_icons(
+            closed_icon=self._folder_closed_icon,
+            open_icon=self._folder_open_icon,
+            selected_icon=self._folder_selected_icon,
+            hover_icon=self._folder_hover_icon,
+        )
+        tree.set_drag_preview_opacity(self._drag_preview_opacity_percent / 100.0)
         self.library_tree = tree
+        tree.installEventFilter(self)
+        tree.viewport().installEventFilter(self)
+        folders_layout.addWidget(tree)
 
-        layout.addWidget(title)
-        layout.addWidget(tree)
-        return container
-
-    def _build_track_list_panel(self) -> QWidget:
-        container = QWidget(self)
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        title = QLabel("Tracks", container)
-        title.setObjectName("panelTitle")
+        tracks_panel = QWidget(container)
+        tracks_layout = QVBoxLayout(tracks_panel)
+        tracks_layout.setContentsMargins(0, 0, 0, 0)
+        tracks_layout.setSpacing(6)
+        tracks_title = QLabel("Tracks & Waypoints", tracks_panel)
+        tracks_title.setObjectName("panelSubTitle")
 
         track_list = TrackListWidget(container)
         track_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         track_list.setDragEnabled(True)
         track_list.setAcceptDrops(False)
+        track_list.setDragDropMode(QListWidget.DragDropMode.DragOnly)
         track_list.setAlternatingRowColors(True)
         track_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         track_list.customContextMenuRequested.connect(self._show_track_context_menu)
         track_list.itemSelectionChanged.connect(self._schedule_preview_update)
         track_list.itemDoubleClicked.connect(self._open_track_preview)
+        track_list.set_drag_preview_opacity(self._drag_preview_opacity_percent / 100.0)
         self.track_list = track_list
+        track_list.installEventFilter(self)
+        track_list.viewport().installEventFilter(self)
+        self._track_list_counts_label = QLabel("Waypoints: 0 | Tracks: 0 | Total: 0", tracks_panel)
+        self._track_list_counts_label.setStyleSheet("QLabel { color: #5e5e5e; }")
+
+        tracks_layout.addWidget(tracks_title)
+        tracks_layout.addWidget(track_list)
+        tracks_layout.addWidget(self._track_list_counts_label)
+
+        library_splitter.addWidget(folders_panel)
+        library_splitter.addWidget(tracks_panel)
+        library_splitter.setStretchFactor(0, 2)
+        library_splitter.setStretchFactor(1, 1)
+        if self._keep_window_configuration_enabled:
+            saved_sizes = get_window_library_splitter_sizes()
+            if len(saved_sizes) == 2:
+                library_splitter.setSizes(saved_sizes)
+            else:
+                library_splitter.setSizes([420, 240])
+        else:
+            library_splitter.setSizes([420, 240])
 
         layout.addWidget(title)
-        layout.addWidget(track_list)
+        layout.addWidget(library_splitter)
         return container
+
+    def _build_tracks_analysis_panel(self) -> QWidget:
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("Tracks & Waypoints", container)
+        title.setObjectName("panelTitle")
+
+        summary = QLabel(
+            "Reserved for Milestone 7: track analysis and metadata view.",
+            container,
+        )
+        summary.setWordWrap(True)
+
+        details = QLabel(
+            "This panel will host per-track statistics, metadata, and analysis outputs.",
+            container,
+        )
+        details.setWordWrap(True)
+        details.setStyleSheet("QLabel { color: #4d4d4d; }")
+
+        layout.addWidget(title)
+        layout.addWidget(summary)
+        layout.addWidget(details)
+        layout.addStretch(1)
+        return container
+
+    def _load_ui_icons(self) -> None:
+        style = self.style()
+
+        self._folder_closed_icon = self._best_icon(
+            QIcon.fromTheme("folder"),
+            style.standardIcon(QStyle.StandardPixmap.SP_DirClosedIcon),
+        )
+        self._folder_open_icon = self._best_icon(
+            QIcon.fromTheme("folder-open"),
+            style.standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
+            self._folder_closed_icon,
+        )
+        self._track_item_icon = self._best_icon(
+            QIcon.fromTheme("text-x-generic"),
+            style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
+        )
+        self._waypoint_item_icon = self._best_icon(
+            QIcon.fromTheme("mark-location"),
+            QIcon.fromTheme("emblem-default"),
+            style.standardIcon(QStyle.StandardPixmap.SP_DialogYesButton),
+        )
+
+        icon_overrides = {
+            "folder_closed": ["folder-closed.svg", "folder-closed.png", "folder_closed.svg", "folder_closed.png"],
+            "folder_open": ["folder-open.svg", "folder-open.png", "folder_open.svg", "folder_open.png"],
+            "folder_selected": ["folder_selected.png", "folder-selected.png", "folder_selected.svg", "folder-selected.svg"],
+            "folder_hover": ["folder-hover.png", "folder_hover.png", "folder-hover.svg", "folder_hover.svg"],
+            "track": ["track.svg", "track.png"],
+            "waypoint": ["map-pin.svg", "map-pin.png", "waypoint.svg", "waypoint.png"],
+        }
+
+        for base_dir in self._candidate_icon_dirs():
+            folder_closed_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_closed"])
+            if folder_closed_icon is not None:
+                self._folder_closed_icon = folder_closed_icon
+
+            folder_open_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_open"])
+            if folder_open_icon is not None:
+                self._folder_open_icon = folder_open_icon
+
+            folder_selected_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_selected"])
+            if folder_selected_icon is not None:
+                self._folder_selected_icon = folder_selected_icon
+
+            folder_hover_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_hover"])
+            if folder_hover_icon is not None:
+                self._folder_hover_icon = folder_hover_icon
+
+            track_icon = self._load_icon_candidate(base_dir, icon_overrides["track"])
+            if track_icon is not None:
+                self._track_item_icon = track_icon
+
+            waypoint_icon = self._load_icon_candidate(base_dir, icon_overrides["waypoint"])
+            if waypoint_icon is not None:
+                self._waypoint_item_icon = waypoint_icon
+
+    def _best_icon(self, *candidates: QIcon) -> QIcon:
+        for icon in candidates:
+            if self._is_icon_renderable(icon):
+                return icon
+        return QIcon()
+
+    def _candidate_icon_dirs(self) -> list[Path]:
+        app_icon_dir = get_app_paths().base_dir / "icons"
+        return [
+            Path.cwd() / "gpx_organizer" / "icons",
+            Path.cwd() / "icons",
+            app_icon_dir,
+        ]
+
+    def _load_icon_candidate(self, base_dir: Path, names: list[str]) -> QIcon | None:
+        for name in names:
+            icon_path = base_dir / name
+            if not icon_path.is_file():
+                continue
+            icon = QIcon(str(icon_path))
+            if self._is_icon_renderable(icon):
+                return icon
+        return None
+
+    def _is_icon_renderable(self, icon: QIcon) -> bool:
+        if icon.isNull():
+            return False
+        # Guard against invalid/unsupported SVGs that instantiate QIcon but render no pixmap.
+        probe = icon.pixmap(16, 16)
+        return not probe.isNull()
 
     def _build_map_panel(self) -> QWidget:
         container = QWidget(self)
@@ -936,6 +1575,22 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event) -> bool:  # pragma: no cover - GUI behavior
         if watched in {
+            self.library_tree,
+            self.track_list,
+            self.library_tree.viewport() if self.library_tree is not None else None,
+            self.track_list.viewport() if self.track_list is not None else None,
+        }:
+            event_type = event.type()
+            if event_type in {
+                QEvent.Type.Wheel,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.DragEnter,
+                QEvent.Type.DragMove,
+                QEvent.Type.Drop,
+            }:
+                self._mark_user_interaction_active()
+
+        if watched in {
             self._map_panel_container,
             self._map_toolbar,
             self.map_web_view,
@@ -981,6 +1636,7 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem([folder.name])
             item.setData(0, FOLDER_ID_ROLE, folder.id)
             item.setData(0, FOLDER_KIND_ROLE, folder.kind)
+            item.setIcon(0, self._folder_closed_icon)
 
             flags = item.flags() | Qt.ItemFlag.ItemIsDropEnabled
             if folder.kind in {"root", "trash"}:
@@ -1005,6 +1661,8 @@ class MainWindow(QMainWindow):
                 item.setExpanded(True)
             if self._keep_folder_tree_structure_enabled and folder.id in self._expanded_folder_ids:
                 item.setExpanded(True)
+            if item.isExpanded():
+                item.setIcon(0, self._folder_open_icon)
 
         target_id = selected_folder_id
         if target_id is None:
@@ -1020,37 +1678,138 @@ class MainWindow(QMainWindow):
                 while parent is not None:
                     parent.setExpanded(True)
                     parent = parent.parent()
+        self._refresh_folder_icons()
+
+    def _refresh_folder_icons(self, _current=None, _previous=None) -> None:
+        if self.library_tree is None:
+            return
+
+        current_item = self.library_tree.currentItem()
+        hover_item = self.library_tree.drop_hover_item()
+
+        def apply_icon(item: QTreeWidgetItem) -> None:
+            if item is hover_item and self._is_icon_renderable(self._folder_hover_icon):
+                item.setIcon(0, self._folder_hover_icon)
+            elif item is current_item and self._is_icon_renderable(self._folder_selected_icon):
+                item.setIcon(0, self._folder_selected_icon)
+            elif item.isExpanded():
+                item.setIcon(0, self._folder_open_icon)
+            else:
+                item.setIcon(0, self._folder_closed_icon)
+
+            for idx in range(item.childCount()):
+                apply_icon(item.child(idx))
+
+        for index in range(self.library_tree.topLevelItemCount()):
+            apply_icon(self.library_tree.topLevelItem(index))
+
+    def _handle_current_folder_changed(self, _current=None, _previous=None) -> None:
+        self._refresh_folder_icons(_current, _previous)
+        self._reload_track_list()
+        if not self._preview_folder_track_list_enabled or _current is None:
+            return
+
+        folder_id = _current.data(0, FOLDER_ID_ROLE)
+        folder_kind = _current.data(0, FOLDER_KIND_ROLE)
+        if folder_id is None:
+            return
+        self._preview_folder_overview_by_id(int(folder_id), str(folder_kind) if folder_kind is not None else None)
 
     def _handle_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
         folder_id = item.data(0, FOLDER_ID_ROLE)
         if folder_id is None:
             return
         self._expanded_folder_ids.add(int(folder_id))
+        self._refresh_folder_icons()
 
     def _handle_tree_item_collapsed(self, item: QTreeWidgetItem) -> None:
         folder_id = item.data(0, FOLDER_ID_ROLE)
         if folder_id is None:
             return
         self._expanded_folder_ids.discard(int(folder_id))
+        self._refresh_folder_icons()
+
+    def _find_tree_item_by_folder_id(self, folder_id: int) -> QTreeWidgetItem | None:
+        if self.library_tree is None:
+            return None
+
+        def visit(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            value = item.data(0, FOLDER_ID_ROLE)
+            if value is not None and int(value) == folder_id:
+                return item
+            for idx in range(item.childCount()):
+                found = visit(item.child(idx))
+                if found is not None:
+                    return found
+            return None
+
+        for index in range(self.library_tree.topLevelItemCount()):
+            found = visit(self.library_tree.topLevelItem(index))
+            if found is not None:
+                return found
+        return None
+
+    def _select_existing_folder_in_tree(self, folder_id: int) -> bool:
+        if self.library_tree is None:
+            return False
+
+        target_item = self._find_tree_item_by_folder_id(folder_id)
+        if target_item is None:
+            return False
+
+        self.library_tree.setCurrentItem(target_item)
+        parent = target_item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        return True
 
     def _restore_last_track_if_needed(self) -> None:
         if not self._keep_last_track_shown_enabled:
             return
 
         if self._last_track_id_to_restore is None:
+            if self._last_folder_id_to_restore is None:
+                return
+            if self._last_folder_id_to_restore not in self._folder_ids:
+                self._last_folder_id_to_restore = None
+                return
+
+            self._restoring_persisted_folder_selection = True
+            try:
+                if not self._select_existing_folder_in_tree(self._last_folder_id_to_restore):
+                    self._load_library_tree(selected_folder_id=self._last_folder_id_to_restore)
+            finally:
+                self._restoring_persisted_folder_selection = False
+            self._last_folder_id_to_restore = None
             return
 
         try:
             track = self.library_store.get_track(self._last_track_id_to_restore)
         except ValueError:
             self._last_track_id_to_restore = None
+            if self._last_folder_id_to_restore is None:
+                return
+            if self._last_folder_id_to_restore not in self._folder_ids:
+                self._last_folder_id_to_restore = None
+                return
+
+            self._restoring_persisted_folder_selection = True
+            try:
+                if not self._select_existing_folder_in_tree(self._last_folder_id_to_restore):
+                    self._load_library_tree(selected_folder_id=self._last_folder_id_to_restore)
+            finally:
+                self._restoring_persisted_folder_selection = False
+            self._last_folder_id_to_restore = None
             return
 
-        self._load_library_tree(selected_folder_id=track.folder_id)
+        if not self._select_existing_folder_in_tree(track.folder_id):
+            self._load_library_tree(selected_folder_id=track.folder_id)
         self._reload_track_list(selected_track_id=track.id)
         if self.track_list is not None:
             self._preview_selected_track()
         self._last_track_id_to_restore = None
+        self._last_folder_id_to_restore = None
 
     def _refresh_folder_topology(self, folders: list[FolderRecord]) -> None:
         self._folder_parent_by_id = {folder.id: folder.parent_id for folder in folders}
@@ -1059,8 +1818,14 @@ class MainWindow(QMainWindow):
         self._evict_obsolete_preview_cache()
 
     def _set_map_delete_behavior(self, use_permanent_delete: bool) -> None:
-        if isinstance(self.map_service, LeafletMapService):
+        if hasattr(self.map_service, "track_delete_uses_permanent"):
             self.map_service.track_delete_uses_permanent = bool(use_permanent_delete)
+
+    def _can_render_folder_overview(self) -> bool:
+        return all(
+            hasattr(self.map_service, name)
+            for name in ("render_placeholder", "render_track_lines_preview")
+        )
 
     def _evict_obsolete_preview_cache(self) -> None:
         obsolete = [folder_id for folder_id in self._preview_cache if folder_id not in self._folder_ids]
@@ -1074,39 +1839,96 @@ class MainWindow(QMainWindow):
             entry = self._preview_cache.get(current)
             if entry is not None:
                 entry.dirty = True
-            self._preview_cache_queue.add(current)
             current = self._folder_parent_by_id.get(current)
+
+        # Rebuild only what the user is currently looking at to keep destructive
+        # operations (delete/move) responsive. Ancestor folders stay marked dirty
+        # and will be rebuilt lazily when opened.
+        selected_folder_id = self._selected_folder_id()
+        if selected_folder_id in self._folder_ids:
+            self._preview_cache_queue.add(selected_folder_id)
+        elif folder_id in self._folder_ids:
+            self._preview_cache_queue.add(folder_id)
 
         self._schedule_preview_cache_rebuild()
 
     def _mark_all_preview_cache_dirty(self) -> None:
-        for folder_id in self._folder_ids:
-            entry = self._preview_cache.get(folder_id)
-            if entry is not None:
-                entry.dirty = True
-            self._preview_cache_queue.add(folder_id)
-        self._schedule_preview_cache_rebuild()
+        # Mark all cached entries stale, but only rebuild the currently selected
+        # folder immediately. Other folders are rebuilt lazily on demand.
+        for entry in self._preview_cache.values():
+            entry.dirty = True
 
-    def _schedule_preview_cache_rebuild(self) -> None:
+        self._preview_cache_queue.clear()
+        selected_folder_id = self._selected_folder_id()
+        if selected_folder_id in self._folder_ids:
+            self._preview_cache_queue.add(selected_folder_id)
+        self._schedule_preview_cache_rebuild(delay_ms=350)
+
+    def _schedule_preview_cache_rebuild(self, delay_ms: int = 250) -> None:
         if not self._preview_cache_queue:
             return
+        if self._defer_preview_rebuilds:
+            self._interaction_idle_timer.start(280)
+            return
         # Debounce rebuilds to coalesce bursts of edits/imports/moves.
-        self._preview_cache_timer.start(250)
+        self._preview_cache_timer.start(delay_ms)
 
     def _process_preview_cache_queue(self) -> None:
         if not self._preview_cache_queue:
             return
+        if self._defer_preview_rebuilds:
+            self._interaction_idle_timer.start(280)
+            return
 
-        folder_id = min(self._preview_cache_queue)
+        selected_folder_id = self._selected_folder_id()
+        if selected_folder_id in self._preview_cache_queue:
+            folder_id = selected_folder_id
+        else:
+            folder_id = min(self._preview_cache_queue)
         self._preview_cache_queue.discard(folder_id)
-        if folder_id in self._folder_ids:
+        try:
             self._rebuild_preview_cache_for_folder(folder_id)
+        except Exception as exc:
+            # Never let one bad folder preview block all queued rebuilds.
+            rendered = LeafletMapService().render_placeholder(
+                title="Map Preview",
+                message=f"Preview build failed: {exc}",
+            )
+            self._preview_cache[folder_id] = _FolderPreviewCacheEntry(
+                html=rendered.html,
+                track_count=0,
+                dirty=False,
+            )
+            if self._selected_folder_id() == folder_id and not self._selected_track_ids():
+                self._set_map_html(rendered.html)
 
         if self._preview_cache_queue:
-            self._preview_cache_timer.start(60)
+            self._preview_cache_timer.start(120)
+
+    def _mark_user_interaction_active(self) -> None:
+        self._defer_preview_rebuilds = True
+        # Keep extending the idle window while the user is interacting.
+        self._interaction_idle_timer.start(280)
+
+    def _resume_deferred_preview_rebuilds(self) -> None:
+        self._defer_preview_rebuilds = False
+        if self._preview_cache_queue:
+            # Resume queued preview work immediately once interaction settles.
+            self._schedule_preview_cache_rebuild(delay_ms=1)
 
     def _rebuild_preview_cache_for_folder(self, folder_id: int) -> None:
-        if not isinstance(self.map_service, LeafletMapService):
+        if not self._can_render_folder_overview():
+            rendered = LeafletMapService().render_placeholder(
+                title="Map Preview",
+                message="Folder overview preview is unavailable with the current map service.",
+            )
+            self._preview_cache[folder_id] = _FolderPreviewCacheEntry(
+                html=rendered.html,
+                track_count=0,
+                dirty=False,
+            )
+            if self._selected_folder_id() == folder_id and not self._selected_track_ids():
+                self._set_map_html(rendered.html)
             return
 
         self._set_map_delete_behavior(self._folder_kind_by_id.get(folder_id) == "trash")
@@ -1144,14 +1966,19 @@ class MainWindow(QMainWindow):
                     dirty=False,
                 )
             else:
+                total_input_count = len(track_inputs)
+
+                # Large folders may contain malformed entries; skip failures per entry
+                # to keep folder preview available instead of stalling the whole rebuild.
                 rendered = self.map_service.render_track_lines_preview(track_inputs)
                 self._preview_cache[folder_id] = _FolderPreviewCacheEntry(
                     html=rendered.html,
-                    track_count=len(track_inputs),
+                    track_count=total_input_count,
                     dirty=False,
                 )
 
         if self._selected_folder_id() == folder_id and not self._selected_track_ids():
+            self._clear_pending_folder_preview()
             entry = self._preview_cache.get(folder_id)
             if entry is not None:
                 self._set_map_html(entry.html)
@@ -1185,31 +2012,114 @@ class MainWindow(QMainWindow):
             return
 
         folder_id = self._selected_folder_id()
-        tracks = self.library_store.list_tracks_recursive(folder_id)
-        self._visible_tracks = tracks
+        folder_kind = self._selected_folder_kind()
+        self.track_list.setProperty("source_folder_id", folder_id)
 
-        self.track_list.blockSignals(True)
-        self.track_list.clear()
-        if not tracks:
-            placeholder = QListWidgetItem("No tracks in this folder")
+        # Root can contain very large hierarchies. Avoid recursive enumeration to
+        # keep folder-tree operations (especially delete/move) responsive.
+        if folder_kind == "root":
+            self._visible_tracks = []
+            self._update_track_list_counts([])
+            self.track_list.blockSignals(True)
+            self.track_list.clear()
+            placeholder = QListWidgetItem("Select a subfolder to view tracks and waypoints")
             placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.track_list.addItem(placeholder)
             self.track_list.blockSignals(False)
             self._set_map_placeholder(
                 title="Map Preview",
-                message="No tracks in this folder view.",
+                message="Please select a subfolder, Track or Waypoint to show the map",
             )
             return
 
-        for track in tracks:
+        tracks = self.library_store.list_tracks_recursive(folder_id)
+
+        def sort_key(track: TrackRecord) -> tuple[int, str, int]:
+            return (
+                0
+                if (
+                    (track.entry_kind == "track" and self._tracks_first_then_waypoints_enabled)
+                    or (track.entry_kind == "waypoint" and not self._tracks_first_then_waypoints_enabled)
+                )
+                else 1,
+                track.display_name.lower(),
+                track.id,
+            )
+
+        tracks = sorted(tracks, key=sort_key)
+        self._visible_tracks = tracks
+        self._update_track_list_counts(tracks)
+
+        self.track_list.blockSignals(True)
+        self.track_list.clear()
+        if not tracks:
+            placeholder = QListWidgetItem("No tracks or waypoints in this folder")
+            placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.track_list.addItem(placeholder)
+            self.track_list.blockSignals(False)
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="No tracks or waypoints in this folder view.",
+            )
+            return
+
+        selected_folder_tracks = [track for track in tracks if track.folder_id == folder_id]
+        subfolder_tracks = [track for track in tracks if track.folder_id != folder_id]
+
+        def add_track_item(track: TrackRecord) -> None:
             item = QListWidgetItem(track.display_name)
             item.setData(TRACK_ID_ROLE, track.id)
+            item.setData(TRACK_KIND_ROLE, track.entry_kind)
+            if track.entry_kind == "waypoint":
+                item.setIcon(self._waypoint_item_icon)
+            else:
+                item.setIcon(self._track_item_icon)
             self.track_list.addItem(item)
             if selected_track_id is not None and track.id == selected_track_id:
                 self.track_list.setCurrentItem(item)
 
+        for track in selected_folder_tracks:
+            add_track_item(track)
+
+        if subfolder_tracks:
+            separator = QListWidgetItem("-- Subfolder content ---")
+            separator.setFlags(separator.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
+            separator_color = QColor(self._subfolder_separator_color)
+            separator_color.setAlphaF(max(0.1, min(1.0, self._subfolder_separator_opacity_percent / 100.0)))
+            separator.setData(Qt.ItemDataRole.ForegroundRole, separator_color)
+            self.track_list.addItem(separator)
+
+            for track in subfolder_tracks:
+                add_track_item(track)
+
         self.track_list.blockSignals(False)
+
+        # For folder navigation, keep list selection empty so map preview reflects
+        # the folder overview rather than a stale/implicit item selection.
+        if selected_track_id is None:
+            self.track_list.clearSelection()
+            self.track_list.setCurrentRow(-1)
+            if self._suppress_folder_overview_once:
+                self._suppress_folder_overview_once = False
+                self._show_select_track_placeholder()
+            elif self._preview_folder_track_list_enabled:
+                self._preview_visible_tracks_overview()
+            else:
+                self._show_select_track_placeholder()
+            return
+
         self._schedule_preview_update()
+
+    def _update_track_list_counts(self, tracks: list[TrackRecord]) -> None:
+        if self._track_list_counts_label is None:
+            return
+
+        waypoint_count = sum(1 for track in tracks if track.entry_kind == "waypoint")
+        track_count = sum(1 for track in tracks if track.entry_kind == "track")
+        total_count = len(tracks)
+        self._track_list_counts_label.setText(
+            f"Waypoints: {waypoint_count} | Tracks: {track_count} | Total: {total_count}"
+        )
 
     def _schedule_preview_update(self) -> None:
         # Coalesce rapid selection changes into one render to keep UI responsive.
@@ -1252,7 +2162,7 @@ class MainWindow(QMainWindow):
         self._mark_preview_cache_dirty_for_ancestor_chain(folder_id)
 
         self.statusBar().showMessage(
-            f"Imported {imported_count} file(s); duplicates: {duplicate_count}",
+            f"Imported {imported_count} item(s); duplicates: {duplicate_count}",
             7000,
         )
 
@@ -1263,13 +2173,192 @@ class MainWindow(QMainWindow):
                 "\n".join(failures[:10]),
             )
 
+    def _import_folder_tree_into_library(self) -> None:
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Import Folder Tree",
+            str(Path.home()),
+        )
+        if not selected_dir:
+            return
+
+        source_root = Path(selected_dir).expanduser().resolve()
+        if not source_root.exists() or not source_root.is_dir():
+            QMessageBox.warning(self, "Import Folder Tree", "Selected path is not a folder.")
+            return
+
+        total_gpx_files = sum(
+            1
+            for candidate in source_root.rglob("*")
+            if candidate.is_file() and candidate.suffix.lower() == ".gpx"
+        )
+        progress_dialog: QProgressDialog | None = None
+        if total_gpx_files > self._import_progress_min_gpx_files:
+            progress_dialog = QProgressDialog(
+                "Preparing folder import...",
+                "Cancel",
+                0,
+                max(1, total_gpx_files),
+                self,
+            )
+            progress_dialog.setWindowTitle("Import Folder Tree")
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setValue(0)
+
+        try:
+            (
+                imported_count,
+                duplicate_count,
+                created_folder_count,
+                failures,
+                imported_root_folder_id,
+                canceled,
+                processed_files,
+            ) = self._import_folder_tree_recursive(
+                source_root,
+                progress_dialog=progress_dialog,
+            )
+            if progress_dialog is not None:
+                progress_dialog.setValue(max(1, total_gpx_files))
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Folder Tree failed", str(exc))
+            return
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.close()
+
+        self._load_library_tree(selected_folder_id=imported_root_folder_id)
+        self._reload_track_list()
+        self._mark_all_preview_cache_dirty()
+
+        if canceled:
+            self.statusBar().showMessage(
+                (
+                    f"Import canceled after {processed_files} file(s); imported {imported_count} item(s), "
+                    f"duplicates: {duplicate_count}, created folders: {created_folder_count}"
+                ),
+                9000,
+            )
+        else:
+            self.statusBar().showMessage(
+                (
+                    f"Imported {imported_count} item(s) from folder tree; "
+                    f"duplicates: {duplicate_count}; created folders: {created_folder_count}"
+                ),
+                8000,
+            )
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Import Folder Tree completed with errors",
+                "\n".join(failures[:10]),
+            )
+
+    def _import_folder_tree_recursive(
+        self,
+        source_root: Path,
+        progress_dialog: QProgressDialog | None = None,
+    ) -> tuple[int, int, int, list[str], int, bool, int]:
+        folders = self.library_store.list_folders()
+        children_by_parent: dict[int, dict[str, int]] = {}
+        for folder in folders:
+            if folder.parent_id is None:
+                continue
+            by_name = children_by_parent.setdefault(folder.parent_id, {})
+            by_name[folder.name.strip().lower()] = folder.id
+
+        created_folder_count = 0
+
+        def ensure_child_folder(parent_id: int, requested_name: str) -> int:
+            nonlocal created_folder_count
+
+            cleaned = requested_name.strip()
+            if not cleaned:
+                cleaned = "Imported"
+
+            by_name = children_by_parent.setdefault(parent_id, {})
+            existing_id = by_name.get(cleaned.lower())
+            if existing_id is not None:
+                return existing_id
+
+            created_id = self.library_store.create_folder(cleaned, parent_id)
+            created_record = self.library_store.get_folder(created_id)
+            by_name[created_record.name.strip().lower()] = created_id
+            by_name[cleaned.lower()] = created_id
+            created_folder_count += 1
+            return created_id
+
+        imported_count = 0
+        duplicate_count = 0
+        failures: list[str] = []
+        processed_files = 0
+        canceled = False
+
+        def update_progress(current_file: Path) -> None:
+            nonlocal processed_files, canceled
+            if progress_dialog is None:
+                return
+
+            processed_files += 1
+            progress_dialog.setLabelText(
+                f"Importing {processed_files}: {current_file.name}"
+            )
+            progress_dialog.setValue(processed_files)
+            QApplication.processEvents()
+            if progress_dialog.wasCanceled():
+                canceled = True
+
+        root_id = self.library_store.get_root_folder_id()
+        imported_root_folder_id = ensure_child_folder(root_id, source_root.name)
+
+        def visit(fs_dir: Path, target_folder_id: int) -> None:
+            nonlocal imported_count, duplicate_count
+            if canceled:
+                return
+
+            for child in sorted(fs_dir.iterdir(), key=lambda p: p.name.lower()):
+                if canceled:
+                    return
+                if child.is_dir():
+                    child_target_folder_id = ensure_child_folder(target_folder_id, child.name)
+                    visit(child, child_target_folder_id)
+                    continue
+
+                if not child.is_file() or child.suffix.lower() != ".gpx":
+                    continue
+
+                try:
+                    results = self.library_store.import_gpx_all(
+                        child,
+                        target_folder_id=target_folder_id,
+                    )
+                    imported_count += len(results)
+                    duplicate_count += sum(1 for result in results if result.is_duplicate)
+                except Exception as exc:  # pragma: no cover - GUI pathway
+                    failures.append(f"{child}: {exc}")
+                finally:
+                    update_progress(child)
+
+        visit(source_root, imported_root_folder_id)
+        return (
+            imported_count,
+            duplicate_count,
+            created_folder_count,
+            failures,
+            imported_root_folder_id,
+            canceled,
+            processed_files,
+        )
+
     def _import_dropped_paths(self, path_values: list[str], folder_id: int) -> None:
         file_paths = [Path(value) for value in path_values]
         imported_count, duplicate_count, failures = self._import_file_paths(file_paths, folder_id)
         self._reload_track_list()
         self._mark_preview_cache_dirty_for_ancestor_chain(folder_id)
         self.statusBar().showMessage(
-            f"Imported {imported_count} dropped GPX file(s); duplicates: {duplicate_count}",
+            f"Imported {imported_count} dropped item(s); duplicates: {duplicate_count}",
             7000,
         )
         if failures:
@@ -1409,20 +2498,31 @@ class MainWindow(QMainWindow):
         new_folder_action = menu.addAction("New Folder")
         new_folder_action.triggered.connect(self._create_folder_dialog)
 
-        rename_folder_action = menu.addAction("Rename")
+        rename_folder_action = menu.addAction("Rename\tF2")
         rename_folder_action.triggered.connect(self._rename_selected_folder_dialog)
 
-        delete_folder_action = menu.addAction("Delete")
+        delete_folder_action = menu.addAction("Delete\tDel")
         delete_folder_action.triggered.connect(self._delete_selected_folder)
 
         menu.addSeparator()
         import_action = menu.addAction("Import GPX Here")
         import_action.triggered.connect(self._import_gpx_into_selected_folder)
 
+        menu.addSeparator()
+        cut_action = menu.addAction("Cut\tCtrl+X")
+        cut_action.triggered.connect(self._cut_selected_item)
+        copy_action = menu.addAction("Copy\tCtrl+C")
+        copy_action.triggered.connect(self._copy_selected_item)
+        paste_action = menu.addAction("Paste\tCtrl+V")
+        paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
+        paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
+
         kind = self._selected_folder_kind()
         if kind in {"root", "trash", None}:
             rename_folder_action.setEnabled(False)
             delete_folder_action.setEnabled(False)
+            cut_action.setEnabled(False)
+            copy_action.setEnabled(False)
 
         menu.exec(self.library_tree.viewport().mapToGlobal(pos))
 
@@ -1434,9 +2534,62 @@ class MainWindow(QMainWindow):
         if target_item is not None:
             target_item.setSelected(True)
 
+        selected_ids = self._selected_track_ids()
+        selected_records = [self.library_store.get_track(track_id) for track_id in selected_ids]
+        has_selection = bool(selected_records)
+        all_waypoints = has_selection and all(record.entry_kind == "waypoint" for record in selected_records)
+
         menu = QMenu(self)
-        rename_action = menu.addAction("Rename")
-        rename_action.triggered.connect(self._rename_selected_track_dialog)
+
+        if all_waypoints:
+            show_action = menu.addAction("Show on Map")
+            show_action.triggered.connect(self._preview_selected_track)
+
+            cut_action = menu.addAction("Cut\tCtrl+X")
+            cut_action.triggered.connect(self._cut_selected_item)
+
+            copy_action = menu.addAction("Copy\tCtrl+C")
+            copy_action.triggered.connect(self._copy_selected_item)
+
+            paste_action = menu.addAction("Paste\tCtrl+V")
+            paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
+
+            rename_action = menu.addAction("Rename\tF2")
+            rename_action.triggered.connect(self._rename_selected_list_entry_dialog)
+
+            menu.addSeparator()
+
+            in_trash = self._selected_folder_kind() == "trash"
+            if in_trash:
+                delete_action = menu.addAction("Delete Permanently\tDel")
+            else:
+                delete_action = menu.addAction("Move to Trash")
+            delete_action.triggered.connect(self._delete_selected_tracks)
+
+            show_action.setEnabled(has_selection)
+            copy_action.setEnabled(has_selection)
+            cut_action.setEnabled(has_selection and self._selected_folder_kind() != "trash")
+            paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
+            rename_action.setEnabled(len(selected_ids) == 1)
+            delete_action.setEnabled(has_selection)
+
+            menu.exec(self.track_list.viewport().mapToGlobal(pos))
+            return
+
+        cut_action = menu.addAction("Cut\tCtrl+X")
+        cut_action.triggered.connect(self._cut_selected_item)
+
+        copy_action = menu.addAction("Copy\tCtrl+C")
+        copy_action.triggered.connect(self._copy_selected_item)
+
+        paste_action = menu.addAction("Paste\tCtrl+V")
+        paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
+        paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
+
+        menu.addSeparator()
+
+        rename_action = menu.addAction("Rename\tF2")
+        rename_action.triggered.connect(self._rename_selected_list_entry_dialog)
 
         reverse_action = menu.addAction("Reverse")
         reverse_action.triggered.connect(self._reverse_selected_tracks)
@@ -1451,7 +2604,7 @@ class MainWindow(QMainWindow):
         move_to_trash_action = None
         delete_action = None
         if in_trash:
-            delete_action = menu.addAction("Delete Permanently")
+            delete_action = menu.addAction("Delete Permanently\tDel")
             delete_action.triggered.connect(self._delete_selected_tracks)
         else:
             move_to_trash_action = menu.addAction("Move to Trash")
@@ -1470,8 +2623,12 @@ class MainWindow(QMainWindow):
         merge_action = menu.addAction("Merge")
         merge_action.triggered.connect(self._merge_selected_tracks)
 
-        if not self._selected_track_ids():
+        has_waypoint = any(record.entry_kind != "track" for record in selected_records)
+
+        if not selected_ids:
             show_action.setEnabled(False)
+            cut_action.setEnabled(False)
+            copy_action.setEnabled(False)
             rename_action.setEnabled(False)
             reverse_action.setEnabled(False)
             trim_action.setEnabled(False)
@@ -1483,10 +2640,108 @@ class MainWindow(QMainWindow):
                 move_to_trash_action.setEnabled(False)
             if delete_action is not None:
                 delete_action.setEnabled(False)
-        elif len(self._selected_track_ids()) < 2:
+        elif len(selected_ids) < 2:
             merge_action.setEnabled(False)
 
+        if self._selected_folder_kind() == "trash":
+            cut_action.setEnabled(False)
+
+        if has_waypoint:
+            reverse_action.setEnabled(False)
+            trim_action.setEnabled(False)
+            split_action.setEnabled(False)
+            merge_action.setEnabled(False)
+            set_color_action.setEnabled(False)
+
         menu.exec(self.track_list.viewport().mapToGlobal(pos))
+
+    def _copy_selected_item(self) -> None:
+        if self.track_list is not None and self.track_list.hasFocus() and self._selected_track_ids():
+            item_ids = tuple(self._selected_track_ids())
+            self._clipboard_payload = _ClipboardPayload(kind="items", item_ids=item_ids, operation="copy")
+            self._clipboard_consumed = False
+            self.statusBar().showMessage(f"Copied {len(item_ids)} item(s)", 4000)
+            return
+
+        folder_id = self._selected_folder_id()
+        folder_kind = self._selected_folder_kind()
+        if folder_kind in {"root", "trash", None}:
+            self.statusBar().showMessage("Root/Trash folder cannot be copied", 4000)
+            return
+
+        self._clipboard_payload = _ClipboardPayload(kind="folder", folder_id=folder_id, operation="copy")
+        self._clipboard_consumed = False
+        self.statusBar().showMessage("Folder copied", 4000)
+
+    def _cut_selected_item(self) -> None:
+        if self.track_list is not None and self.track_list.hasFocus() and self._selected_track_ids():
+            if self._selected_folder_kind() == "trash":
+                self.statusBar().showMessage("Cannot cut items from Trash", 4000)
+                return
+            item_ids = tuple(self._selected_track_ids())
+            self._clipboard_payload = _ClipboardPayload(kind="items", item_ids=item_ids, operation="cut")
+            self._clipboard_consumed = False
+            self.statusBar().showMessage(f"Cut {len(item_ids)} item(s)", 4000)
+            return
+
+        folder_id = self._selected_folder_id()
+        folder_kind = self._selected_folder_kind()
+        if folder_kind in {"root", "trash", None}:
+            self.statusBar().showMessage("Root/Trash folder cannot be cut", 4000)
+            return
+
+        self._clipboard_payload = _ClipboardPayload(kind="folder", folder_id=folder_id, operation="cut")
+        self._clipboard_consumed = False
+        self.statusBar().showMessage("Folder cut", 4000)
+
+    def _paste_clipboard_into_selected_folder(self) -> None:
+        if self._clipboard_payload is None or self._clipboard_consumed:
+            self.statusBar().showMessage("Clipboard is empty", 3000)
+            return
+
+        target_folder_id = self._selected_folder_id()
+        target_kind = self._selected_folder_kind()
+        if target_kind is None:
+            return
+
+        payload = self._clipboard_payload
+        try:
+            if payload.kind == "items":
+                if payload.operation == "copy":
+                    copied = self.library_store.copy_items_to_folder(list(payload.item_ids), target_folder_id)
+                    self.statusBar().showMessage(f"Pasted {len(copied)} copied item(s)", 5000)
+                else:
+                    moved_count = 0
+                    for track_id in payload.item_ids:
+                        self.library_store.move_track_to_folder(track_id, target_folder_id)
+                        moved_count += 1
+                    self._clipboard_consumed = True
+                    self.statusBar().showMessage(f"Moved {moved_count} item(s)", 5000)
+
+                self._load_library_tree(selected_folder_id=target_folder_id)
+                self._reload_track_list()
+                self._mark_preview_cache_dirty_for_ancestor_chain(target_folder_id)
+                return
+
+            if payload.kind == "folder" and payload.folder_id is not None:
+                source_folder_id = payload.folder_id
+                if source_folder_id == target_folder_id:
+                    self.statusBar().showMessage("Cannot paste folder into itself", 4000)
+                    return
+
+                if payload.operation == "copy":
+                    new_folder_id = self.library_store.copy_folder_subtree(source_folder_id, target_folder_id)
+                    self._load_library_tree(selected_folder_id=new_folder_id)
+                    self._mark_all_preview_cache_dirty()
+                    self.statusBar().showMessage("Folder copied", 5000)
+                else:
+                    self.library_store.move_folder(source_folder_id, target_folder_id)
+                    self._load_library_tree(selected_folder_id=source_folder_id)
+                    self._mark_all_preview_cache_dirty()
+                    self._clipboard_consumed = True
+                    self.statusBar().showMessage("Folder moved", 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Paste failed", str(exc))
 
     def _open_track_preview(self, item: QListWidgetItem) -> None:
         track_id = item.data(TRACK_ID_ROLE)
@@ -1496,14 +2751,18 @@ class MainWindow(QMainWindow):
 
         track_name = item.text()
         try:
-            managed_path = self.library_store.get_track_managed_path(int(track_id))
+            track = self.library_store.get_track(int(track_id))
+            managed_path = self.library_store.get_track_managed_path(track.id)
             if isinstance(self.map_service, LeafletMapService):
                 self._set_map_delete_behavior(self._selected_folder_kind() == "trash")
-                rendered = self.map_service.render_track(
-                    managed_path,
-                    track_name,
-                    initial_overlays=self._map_overlay_state,
-                )
+                if track.entry_kind == "waypoint":
+                    rendered = self.map_service.render_waypoint(managed_path, track_name)
+                else:
+                    rendered = self.map_service.render_track(
+                        managed_path,
+                        track_name,
+                        initial_overlays=self._map_overlay_state,
+                    )
             else:
                 rendered = self.map_service.render_track(managed_path, track_name)
             self._set_map_html(rendered.html)
@@ -1541,12 +2800,21 @@ class MainWindow(QMainWindow):
             self._open_track_preview(selected_items[0])
             return
 
+        selected_kinds = {
+            str(item.data(TRACK_KIND_ROLE))
+            for item in selected_items
+            if item.data(TRACK_KIND_ROLE) is not None
+        }
+        if "waypoint" in selected_kinds:
+            self._open_track_preview(selected_items[0])
+            return
+
         self._open_selected_tracks_with_overlays(selected_items)
 
     def _show_select_track_placeholder(self) -> None:
         self._set_map_placeholder(
             title="Map Preview",
-            message="Select a track for preview",
+            message="Select a track or waypoint for preview",
         )
 
     def _preview_temp_track(self, preview_path: Path, preview_name: str) -> None:
@@ -1567,10 +2835,43 @@ class MainWindow(QMainWindow):
                 preview_path.unlink()
 
     def _preview_visible_tracks_overview(self) -> None:
-        folder_id = self._selected_folder_id()
-        entry = self._preview_cache.get(folder_id)
+        self._preview_folder_overview_by_id(
+            folder_id=self._selected_folder_id(),
+            folder_kind=self._selected_folder_kind(),
+        )
 
+    def _show_pending_folder_preview_placeholder(self) -> None:
+        folder_id = self._pending_folder_preview_id
+        if folder_id is None:
+            return
+        if self._selected_folder_id() != folder_id:
+            return
+        if self._selected_track_ids():
+            return
+        if folder_id in self._preview_cache:
+            return
+
+        self._set_map_placeholder(
+            title="Map Preview",
+            message="Preparing folder preview...",
+        )
+
+    def _clear_pending_folder_preview(self) -> None:
+        self._pending_folder_preview_id = None
+        self._preview_prepare_placeholder_timer.stop()
+
+    def _preview_folder_overview_by_id(self, folder_id: int, folder_kind: str | None) -> None:
+        if folder_kind == "root":
+            self._clear_pending_folder_preview()
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="Please select a subfolder, Track or Waypoint to show the map",
+            )
+            return
+
+        entry = self._preview_cache.get(folder_id)
         if entry is not None:
+            self._clear_pending_folder_preview()
             self._set_map_html(entry.html)
             self.statusBar().showMessage(
                 f"Previewing {entry.track_count} track(s) in folder view",
@@ -1581,12 +2882,20 @@ class MainWindow(QMainWindow):
                 self._schedule_preview_cache_rebuild()
             return
 
-        self._set_map_placeholder(
-            title="Map Preview",
-            message="Preparing folder preview...",
-        )
+        self._pending_folder_preview_id = folder_id
+        if self._restoring_persisted_folder_selection:
+            self._set_map_placeholder(
+                title="Map Preview",
+                message="Preparing folder preview...",
+            )
+            # During startup restore, give Qt one paint cycle before kicking off
+            # potentially expensive rebuild work to avoid a blank map panel.
+            rebuild_delay_ms = 180
+        else:
+            self._preview_prepare_placeholder_timer.start(120)
+            rebuild_delay_ms = 1
         self._preview_cache_queue.add(folder_id)
-        self._schedule_preview_cache_rebuild()
+        self._schedule_preview_cache_rebuild(delay_ms=rebuild_delay_ms)
 
     def _build_folder_path_by_id(self) -> dict[int, str]:
         folders = self.library_store.list_folders()
@@ -1642,7 +2951,15 @@ class MainWindow(QMainWindow):
         self._current_map_html = html_content
 
         if self.map_web_view is not None:
-            self.map_web_view.setHtml(html_content)
+            if len(html_content) > WEBENGINE_SETHTML_MAX_CHARS:
+                # QWebEngine setHtml can fail silently for very large documents
+                # because it internally uses a data URL with size limits.
+                self.map_web_view.setContent(
+                    html_content.encode("utf-8"),
+                    "text/html;charset=UTF-8",
+                )
+            else:
+                self.map_web_view.setHtml(html_content)
             return
 
         # Fallback path: render map HTML in the system browser when WebEngine
@@ -1709,12 +3026,17 @@ class MainWindow(QMainWindow):
     def _open_preferences_dialog(self) -> None:
         dialog = PreferencesDialog(
             library_root_path=str(self.library_store.library_root),
+            drag_preview_opacity_percent=get_window_drag_preview_opacity_percent(),
+            import_progress_min_gpx_files=get_window_import_progress_min_gpx_files(),
+            subfolder_separator_color=get_window_subfolder_separator_color(),
+            subfolder_separator_opacity_percent=get_window_subfolder_separator_opacity_percent(),
             current_threshold_px=get_map_responsive_threshold_px(),
             preview_folder_track_list=get_window_preview_folder_track_list_enabled(),
             preview_lightening_factor=get_map_preview_lightening_factor(),
             keep_window_configuration=get_window_keep_configuration_enabled(),
             keep_folder_tree_structure=get_window_keep_folder_tree_structure_enabled(),
             keep_last_track_shown=get_window_keep_last_track_shown_enabled(),
+            tracks_first_then_waypoints=get_window_tracks_first_then_waypoints_enabled(),
             rest_stop_color=get_map_rest_stop_color(),
             rest_stop_size_px=get_map_rest_stop_size_px(),
             default_track_color=get_map_default_track_color(),
@@ -1759,6 +3081,22 @@ class MainWindow(QMainWindow):
         self._preview_folder_track_list_enabled = set_window_preview_folder_track_list_enabled(
             dialog.selected_preview_folder_track_list_enabled()
         )
+        self._drag_preview_opacity_percent = set_window_drag_preview_opacity_percent(
+            dialog.selected_drag_preview_opacity_percent()
+        )
+        self._import_progress_min_gpx_files = set_window_import_progress_min_gpx_files(
+            dialog.selected_import_progress_min_gpx_files()
+        )
+        self._subfolder_separator_color = set_window_subfolder_separator_color(
+            dialog.selected_subfolder_separator_color()
+        )
+        self._subfolder_separator_opacity_percent = set_window_subfolder_separator_opacity_percent(
+            dialog.selected_subfolder_separator_opacity_percent()
+        )
+        if self.library_tree is not None:
+            self.library_tree.set_drag_preview_opacity(self._drag_preview_opacity_percent / 100.0)
+        if self.track_list is not None:
+            self.track_list.set_drag_preview_opacity(self._drag_preview_opacity_percent / 100.0)
         saved_preview_lightening_factor = set_map_preview_lightening_factor(
             dialog.selected_preview_lightening_factor()
         )
@@ -1770,6 +3108,9 @@ class MainWindow(QMainWindow):
         )
         self._keep_last_track_shown_enabled = set_window_keep_last_track_shown_enabled(
             dialog.selected_keep_last_track_shown_enabled()
+        )
+        self._tracks_first_then_waypoints_enabled = set_window_tracks_first_then_waypoints_enabled(
+            dialog.selected_tracks_first_then_waypoints_enabled()
         )
         saved_rest_stop_color = set_map_rest_stop_color(dialog.selected_rest_stop_color())
         saved_rest_stop_size_px = set_map_rest_stop_size_px(dialog.selected_rest_stop_size_px())
@@ -1831,6 +3172,9 @@ class MainWindow(QMainWindow):
 
         if not self._keep_last_track_shown_enabled:
             set_window_last_track_id(None)
+            set_window_last_folder_id(None)
+
+        self._reload_track_list(selected_track_id=self._current_selected_track_id())
 
         if self._rerender_current_track_preview():
             self.statusBar().showMessage(
@@ -1845,6 +3189,9 @@ class MainWindow(QMainWindow):
         )
 
     def _set_selected_track_color(self) -> None:
+        if not self._selection_contains_only_tracks("Set track color"):
+            return
+
         track_ids = self._selected_track_ids()
         if len(track_ids) != 1:
             QMessageBox.information(self, "Set track color", "Please select exactly one track.")
@@ -1879,6 +3226,26 @@ class MainWindow(QMainWindow):
         if value is None:
             return None
         return int(value)
+
+    def _select_track_in_current_list(self, track_id: int) -> bool:
+        if self.track_list is None:
+            return False
+
+        for row in range(self.track_list.count()):
+            item = self.track_list.item(row)
+            if item is None:
+                continue
+            value = item.data(TRACK_ID_ROLE)
+            if value is None:
+                continue
+            if int(value) != int(track_id):
+                continue
+
+            self.track_list.setCurrentItem(item)
+            self.track_list.scrollToItem(item)
+            return True
+
+        return False
 
     def _handle_map_web_url_changed(self, url) -> None:
         fragment = url.fragment()
@@ -1959,8 +3326,20 @@ class MainWindow(QMainWindow):
             self._rerender_current_track_preview()
             return
 
-        self._load_library_tree(selected_folder_id=track.folder_id)
-        self._reload_track_list(selected_track_id=track_id)
+        # Avoid duplicate heavy list rebuilds when jumping from overview-map track
+        # clicks to list selection. Selecting a folder in the tree already triggers
+        # one list reload through currentItemChanged.
+        if self._selected_folder_id() != track.folder_id:
+            # We are navigating to a concrete track, so skip one folder-overview
+            # preview render that would otherwise run before track rendering.
+            self._suppress_folder_overview_once = True
+            if not self._select_existing_folder_in_tree(track.folder_id):
+                self._load_library_tree(selected_folder_id=track.folder_id)
+
+        if not self._select_track_in_current_list(track_id):
+            self._reload_track_list(selected_track_id=track_id)
+
+        self._schedule_preview_update()
         self.statusBar().showMessage(f"Selected track: {track.display_name}", 5000)
 
     def _run_track_action_from_overview_map(self, track_id: int, operation: str) -> None:
@@ -2247,6 +3626,9 @@ class MainWindow(QMainWindow):
             self._update_undo_redo_actions()
 
     def _reverse_selected_tracks(self) -> None:
+        if not self._selection_contains_only_tracks("Reverse track"):
+            return
+
         track_ids = self._selected_track_ids()
         if len(track_ids) != 1:
             QMessageBox.information(self, "Reverse track", "Please select exactly one track.")
@@ -2290,6 +3672,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Reverse track failed", str(exc))
 
     def _trim_selected_track(self) -> None:
+        if not self._selection_contains_only_tracks("Trim track"):
+            return
+
         track_ids = self._selected_track_ids()
         if len(track_ids) != 1:
             QMessageBox.information(self, "Trim track", "Please select exactly one track.")
@@ -2384,6 +3769,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Trim track failed", str(exc))
 
     def _split_selected_track(self) -> None:
+        if not self._selection_contains_only_tracks("Split track"):
+            return
+
         track_ids = self._selected_track_ids()
         if len(track_ids) != 1:
             QMessageBox.information(self, "Split track", "Please select exactly one track.")
@@ -2458,6 +3846,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Split track failed", str(exc))
 
     def _merge_selected_tracks(self) -> None:
+        if not self._selection_contains_only_tracks("Merge tracks"):
+            return
+
         track_ids = self._selected_track_ids()
         if len(track_ids) < 2:
             QMessageBox.information(self, "Merge tracks", "Please select at least two tracks.")
@@ -2551,10 +3942,15 @@ class MainWindow(QMainWindow):
         if folder_kind in {"root", "trash", None}:
             return
 
+        try:
+            folder_record = self.library_store.get_folder(folder_id)
+        except Exception:
+            folder_record = None
+
         reply = QMessageBox.question(
             self,
             "Delete folder",
-            "Delete this folder subtree? Tracks inside will be moved to Trash.",
+            "Delete this folder subtree? Items inside will be moved to Trash.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2562,11 +3958,17 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            root_id = self.library_store.get_root_folder_id()
+            fallback_folder_id = (
+                folder_record.parent_id
+                if folder_record is not None and folder_record.parent_id is not None
+                else self.library_store.get_root_folder_id()
+            )
             self.library_store.delete_folder(folder_id)
-            self._load_library_tree(selected_folder_id=root_id)
+            # Defer expensive folder-overview rebuild once right after deletion.
+            self._suppress_folder_overview_once = True
+            self._load_library_tree(selected_folder_id=fallback_folder_id)
             self._mark_all_preview_cache_dirty()
-            self.statusBar().showMessage("Folder deleted; tracks moved to Trash", 5000)
+            self.statusBar().showMessage("Folder deleted; items moved to Trash", 5000)
         except Exception as exc:
             QMessageBox.warning(self, "Delete folder failed", str(exc))
 
@@ -2581,33 +3983,53 @@ class MainWindow(QMainWindow):
                 track_ids.append(int(value))
         return track_ids
 
-    def _rename_selected_track_dialog(self) -> None:
+    def _selection_contains_only_tracks(self, action_title: str) -> bool:
+        track_ids = self._selected_track_ids()
+        if not track_ids:
+            return True
+
+        for track_id in track_ids:
+            track = self.library_store.get_track(track_id)
+            if track.entry_kind != "track":
+                QMessageBox.information(
+                    self,
+                    action_title,
+                    "This action is available only for track entries, not waypoints.",
+                )
+                return False
+        return True
+
+    def _rename_selected_list_entry_dialog(self) -> None:
         track_ids = self._selected_track_ids()
         if len(track_ids) != 1:
-            QMessageBox.information(self, "Rename track", "Please select exactly one track.")
+            QMessageBox.information(self, "Rename item", "Please select exactly one item.")
             return
 
         if self.track_list is None or self.track_list.currentItem() is None:
             return
 
+        selected_track = self.library_store.get_track(track_ids[0])
+        entry_label = "waypoint" if selected_track.entry_kind == "waypoint" else "track"
         current_name = self.track_list.currentItem().text()
         text, ok = QInputDialog.getText(
             self,
-            "Rename Track",
-            "Track name:",
+            f"Rename {entry_label.capitalize()}",
+            f"{entry_label.capitalize()} name:",
             text=current_name,
         )
         if not ok:
             return
 
         try:
-            track = self.library_store.get_track(track_ids[0])
             self.library_store.rename_track(track_ids[0], text)
             self._reload_track_list()
-            self._mark_preview_cache_dirty_for_ancestor_chain(track.folder_id)
-            self.statusBar().showMessage("Track renamed", 4000)
+            self._mark_preview_cache_dirty_for_ancestor_chain(selected_track.folder_id)
+            self.statusBar().showMessage(f"{entry_label.capitalize()} renamed", 4000)
         except Exception as exc:
-            QMessageBox.warning(self, "Rename track failed", str(exc))
+            QMessageBox.warning(self, f"Rename {entry_label} failed", str(exc))
+
+    def _rename_selected_track_dialog(self) -> None:
+        self._rename_selected_list_entry_dialog()
 
     def _delete_selected_tracks(self) -> None:
         track_ids = self._selected_track_ids()
@@ -2616,13 +4038,13 @@ class MainWindow(QMainWindow):
 
         in_trash = self._selected_folder_kind() == "trash"
         if in_trash:
-            prompt = "Permanently delete selected tracks from Trash?"
+            prompt = "Permanently delete selected items from Trash?"
         else:
-            prompt = "Move selected tracks to Trash?"
+            prompt = "Move selected items to Trash?"
 
         reply = QMessageBox.question(
             self,
-            "Delete tracks",
+            "Delete items",
             prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -2656,7 +4078,7 @@ class MainWindow(QMainWindow):
 
     def _rename_selected_item(self) -> None:
         if self.track_list is not None and self.track_list.hasFocus() and self._selected_track_ids():
-            self._rename_selected_track_dialog()
+            self._rename_selected_list_entry_dialog()
             return
         self._rename_selected_folder_dialog()
 
@@ -2676,16 +4098,37 @@ class MainWindow(QMainWindow):
             self._load_library_tree(selected_folder_id=folder_id)
             QMessageBox.warning(self, "Move folder failed", str(exc))
 
-    def _move_tracks_to_folder(self, track_ids: list[int], folder_id: int) -> None:
+    def _copy_folder_subtree_persisted(self, folder_id: int, target_parent_id: int) -> None:
+        try:
+            copied_root_id = self.library_store.copy_folder_subtree(folder_id, target_parent_id)
+            self._load_library_tree(selected_folder_id=copied_root_id)
+            self._mark_all_preview_cache_dirty()
+            self.statusBar().showMessage("Folder copied", 4000)
+        except Exception as exc:
+            self._load_library_tree(selected_folder_id=target_parent_id)
+            QMessageBox.warning(self, "Copy folder failed", str(exc))
+
+    def _move_tracks_to_folder(self, track_ids: list[int], folder_id: int, operation: str = "move") -> None:
         failures: list[str] = []
         source_folder_ids: set[int] = set()
-        for track_id in track_ids:
+        copied_count = 0
+        moved_count = 0
+
+        if operation == "copy":
             try:
-                track = self.library_store.get_track(track_id)
-                source_folder_ids.add(track.folder_id)
-                self.library_store.move_track_to_folder(track_id, folder_id)
+                copied = self.library_store.copy_items_to_folder(track_ids, folder_id)
+                copied_count = len(copied)
             except Exception as exc:
                 failures.append(str(exc))
+        else:
+            for track_id in track_ids:
+                try:
+                    track = self.library_store.get_track(track_id)
+                    source_folder_ids.add(track.folder_id)
+                    self.library_store.move_track_to_folder(track_id, folder_id)
+                    moved_count += 1
+                except Exception as exc:
+                    failures.append(str(exc))
 
         self._load_library_tree(selected_folder_id=folder_id)
         self._reload_track_list()
@@ -2693,16 +4136,19 @@ class MainWindow(QMainWindow):
         for source_folder_id in source_folder_ids:
             self._mark_preview_cache_dirty_for_ancestor_chain(source_folder_id)
 
-        moved_count = len(track_ids) - len(failures)
-        self.statusBar().showMessage(f"Moved {moved_count} track(s)", 4000)
+        if operation == "copy":
+            self.statusBar().showMessage(f"Copied {copied_count} item(s)", 4000)
+        else:
+            self.statusBar().showMessage(f"Moved {moved_count} track(s)", 4000)
         if failures:
-            QMessageBox.warning(self, "Move tracks failed", "\n".join(failures[:8]))
+            title = "Copy items failed" if operation == "copy" else "Move tracks failed"
+            QMessageBox.warning(self, title, "\n".join(failures[:8]))
 
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
             "About GPX Organizer",
-            "GPX Organizer\nMilestone 3 organizer workflows\nPySide6 desktop application scaffold.",
+            "Python Application to store and edit GPX files\nBuilt with PySide6.\nAuthor: Karl Molter\nDeveloped with VS Code and Github Copilot support\nVersion 0.1 - 27.09.2026",
         )
 
     def closeEvent(self, event) -> None:  # pragma: no cover - GUI behavior
@@ -2710,6 +4156,8 @@ class MainWindow(QMainWindow):
             set_window_size(self.width(), self.height())
             if self._main_splitter is not None:
                 set_window_splitter_sizes(self._main_splitter.sizes())
+            if self._library_splitter is not None:
+                set_window_library_splitter_sizes(self._library_splitter.sizes())
 
         if self._keep_folder_tree_structure_enabled:
             set_window_folder_tree_expanded_ids(sorted(self._expanded_folder_ids))
@@ -2717,9 +4165,15 @@ class MainWindow(QMainWindow):
             set_window_folder_tree_expanded_ids([])
 
         if self._keep_last_track_shown_enabled:
-            set_window_last_track_id(self._current_selected_track_id())
+            selected_track_id = self._current_selected_track_id()
+            set_window_last_track_id(selected_track_id)
+            if selected_track_id is None:
+                set_window_last_folder_id(self._selected_folder_id())
+            else:
+                set_window_last_folder_id(None)
         else:
             set_window_last_track_id(None)
+            set_window_last_folder_id(None)
 
         super().closeEvent(event)
 

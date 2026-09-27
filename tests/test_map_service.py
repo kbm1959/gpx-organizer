@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gpx_organizer.map_service import LeafletMapService
+from gpx_organizer.map_service import LeafletMapService, TRACK_RENDER_MAX_POINTS
 
 
 SAMPLE_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -22,6 +22,14 @@ SAMPLE_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
       </trkpt>
     </trkseg>
   </trk>
+</gpx>
+"""
+
+WAYPOINT_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<gpx version=\"1.1\" creator=\"test\" xmlns=\"http://www.topografix.com/GPX/1/1\">
+    <wpt lat=\"49.755773\" lon=\"6.993925\">
+        <name>Home</name>
+    </wpt>
 </gpx>
 """
 
@@ -119,7 +127,7 @@ def test_render_track_lines_preview_for_multiple_tracks(tmp_path: Path) -> None:
     )
 
     assert rendered.title == "Track Overview"
-    assert "track(s) in current folder view" in rendered.html
+    assert "waypoint(s) in current folder view" in rendered.html
     assert "L.featureGroup().addTo(map)" in rendered.html
     assert "L.control.scale({ imperial: false }).addTo(map);" in rendered.html
 
@@ -167,3 +175,74 @@ def test_render_track_lines_preview_contains_each_track_entry(tmp_path: Path) ->
     assert "bindTooltip(track.hoverLabel" in rendered.html
     assert "action=open_track&track_id=" in rendered.html
     assert "window.__gpxFitTrack = function()" in rendered.html
+
+
+def test_render_waypoint_contains_marker_and_title(tmp_path: Path) -> None:
+    waypoint_path = tmp_path / "waypoint.gpx"
+    waypoint_path.write_text(WAYPOINT_GPX, encoding="utf-8")
+
+    service = LeafletMapService()
+    rendered = service.render_waypoint(waypoint_path, "Home Pin")
+
+    assert rendered.title == "Home Pin"
+    assert "circleMarker" in rendered.html
+    assert "Home" in rendered.html
+
+
+def test_render_track_lines_preview_includes_waypoints(tmp_path: Path) -> None:
+    gpx_track = tmp_path / "track.gpx"
+    gpx_waypoint = tmp_path / "waypoint.gpx"
+    gpx_track.write_text(SAMPLE_GPX, encoding="utf-8")
+    gpx_waypoint.write_text(WAYPOINT_GPX, encoding="utf-8")
+
+    service = LeafletMapService()
+    rendered = service.render_track_lines_preview(
+        [
+            (1, gpx_track, "Track A", "My Library/Track A"),
+            (2, gpx_waypoint, "Home Pin", "My Library/Home Pin"),
+        ]
+    )
+
+    assert "waypoint(s) in current folder view" in rendered.html
+    assert "const waypoints =" in rendered.html
+    assert "circleMarker" in rendered.html
+
+
+def test_large_track_is_downsampled_for_render_payload(tmp_path: Path) -> None:
+        gpx_path = tmp_path / "dense_track.gpx"
+
+        points_xml: list[str] = []
+        for idx in range(TRACK_RENDER_MAX_POINTS + 800):
+                lat = 48.100000 + idx * 0.00001
+                lon = 7.100000 + idx * 0.00001
+                points_xml.append(
+                        f"""
+            <trkpt lat=\"{lat:.6f}\" lon=\"{lon:.6f}\">
+                <ele>200</ele>
+                <time>2026-08-08T08:00:00Z</time>
+            </trkpt>"""
+                )
+
+        gpx_path.write_text(
+                """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<gpx version=\"1.1\" creator=\"test\" xmlns=\"http://www.topografix.com/GPX/1/1\">
+    <trk>
+        <name>Dense Sample</name>
+        <trkseg>
+"""
+                + "\n".join(points_xml)
+                + """
+        </trkseg>
+    </trk>
+</gpx>
+""",
+                encoding="utf-8",
+        )
+
+        service = LeafletMapService()
+        payload = service._build_track_payload(gpx_path, "Dense Sample")
+
+        assert payload is not None
+        coordinates = payload["coordinates"]
+        assert isinstance(coordinates, list)
+        assert len(coordinates) == TRACK_RENDER_MAX_POINTS

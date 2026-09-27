@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """Run the GPX Organizer desktop application."""
 
 from __future__ import annotations

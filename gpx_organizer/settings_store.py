@@ -34,10 +34,17 @@ DEFAULT_SETTINGS = {
     "window_keep_configuration": "1",
     "window_keep_folder_tree_structure": "1",
     "window_keep_last_track_shown": "1",
+    "window_tracks_first_then_waypoints": "0",
+    "window_drag_preview_opacity_percent": "90",
+    "window_import_progress_min_gpx_files": "10",
+    "window_subfolder_separator_color": "#6E6E6E",
+    "window_subfolder_separator_opacity_percent": "70",
     "window_size": "1400,840",
     "window_splitter_sizes": "",
+    "window_library_splitter_sizes": "",
     "window_folder_tree_expanded_ids": "",
     "window_last_track_id": "",
+    "window_last_folder_id": "",
 }
 
 MIN_MAP_RESPONSIVE_THRESHOLD_PX = 320
@@ -80,6 +87,17 @@ DEFAULT_WINDOW_PREVIEW_FOLDER_TRACK_LIST = True
 DEFAULT_WINDOW_KEEP_CONFIGURATION = True
 DEFAULT_WINDOW_KEEP_FOLDER_TREE_STRUCTURE = True
 DEFAULT_WINDOW_KEEP_LAST_TRACK_SHOWN = True
+DEFAULT_WINDOW_TRACKS_FIRST_THEN_WAYPOINTS = False
+DEFAULT_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 90
+MIN_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 10
+MAX_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 100
+DEFAULT_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES = 10
+MIN_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES = 0
+MAX_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES = 100000
+DEFAULT_WINDOW_SUBFOLDER_SEPARATOR_COLOR = "#6E6E6E"
+DEFAULT_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT = 70
+MIN_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT = 10
+MAX_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT = 100
 DEFAULT_WINDOW_WIDTH = 1400
 DEFAULT_WINDOW_HEIGHT = 840
 MIN_WINDOW_WIDTH = 640
@@ -562,6 +580,113 @@ def set_window_keep_last_track_shown_enabled(enabled: bool) -> bool:
     return value
 
 
+def get_window_tracks_first_then_waypoints_enabled() -> bool:
+    settings = load_settings()
+    return _to_bool(
+        settings.get("window_tracks_first_then_waypoints", ""),
+        DEFAULT_WINDOW_TRACKS_FIRST_THEN_WAYPOINTS,
+    )
+
+
+def set_window_tracks_first_then_waypoints_enabled(enabled: bool) -> bool:
+    value = bool(enabled)
+    settings = load_settings()
+    settings["window_tracks_first_then_waypoints"] = "1" if value else "0"
+    save_settings(settings)
+    return value
+
+
+def get_window_drag_preview_opacity_percent() -> int:
+    settings = load_settings()
+    raw = settings.get("window_drag_preview_opacity_percent", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT
+
+    return max(
+        MIN_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT,
+        min(MAX_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT, value),
+    )
+
+
+def set_window_drag_preview_opacity_percent(value: int) -> int:
+    normalized = max(
+        MIN_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT,
+        min(MAX_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT, int(value)),
+    )
+    settings = load_settings()
+    settings["window_drag_preview_opacity_percent"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_window_import_progress_min_gpx_files() -> int:
+    settings = load_settings()
+    raw = settings.get("window_import_progress_min_gpx_files", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES
+
+    return max(
+        MIN_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES,
+        min(MAX_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES, value),
+    )
+
+
+def set_window_import_progress_min_gpx_files(value: int) -> int:
+    normalized = max(
+        MIN_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES,
+        min(MAX_WINDOW_IMPORT_PROGRESS_MIN_GPX_FILES, int(value)),
+    )
+    settings = load_settings()
+    settings["window_import_progress_min_gpx_files"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_window_subfolder_separator_color() -> str:
+    settings = load_settings()
+    return _normalize_hex_color(
+        settings.get("window_subfolder_separator_color", ""),
+        DEFAULT_WINDOW_SUBFOLDER_SEPARATOR_COLOR,
+    )
+
+
+def set_window_subfolder_separator_color(value: str) -> str:
+    color = _normalize_hex_color(value, DEFAULT_WINDOW_SUBFOLDER_SEPARATOR_COLOR)
+    settings = load_settings()
+    settings["window_subfolder_separator_color"] = color
+    save_settings(settings)
+    return color
+
+
+def get_window_subfolder_separator_opacity_percent() -> int:
+    settings = load_settings()
+    raw = settings.get("window_subfolder_separator_opacity_percent", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT
+
+    return max(
+        MIN_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT,
+        min(MAX_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT, value),
+    )
+
+
+def set_window_subfolder_separator_opacity_percent(value: int) -> int:
+    normalized = max(
+        MIN_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT,
+        min(MAX_WINDOW_SUBFOLDER_SEPARATOR_OPACITY_PERCENT, int(value)),
+    )
+    settings = load_settings()
+    settings["window_subfolder_separator_opacity_percent"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
 def get_window_size() -> tuple[int, int]:
     settings = load_settings()
     raw = settings.get("window_size", "").strip()
@@ -622,6 +747,39 @@ def set_window_splitter_sizes(sizes: list[int]) -> list[int]:
     return normalized
 
 
+def get_window_library_splitter_sizes() -> list[int]:
+    settings = load_settings()
+    raw = settings.get("window_library_splitter_sizes", "").strip()
+    if not raw:
+        return []
+
+    result: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value > 0:
+            result.append(value)
+    return result
+
+
+def set_window_library_splitter_sizes(sizes: list[int]) -> list[int]:
+    normalized: list[int] = []
+    for size in sizes:
+        value = int(size)
+        if value > 0:
+            normalized.append(value)
+
+    settings = load_settings()
+    settings["window_library_splitter_sizes"] = ",".join(str(value) for value in normalized)
+    save_settings(settings)
+    return normalized
+
+
 def get_window_folder_tree_expanded_ids() -> list[int]:
     settings = load_settings()
     raw = settings.get("window_folder_tree_expanded_ids", "").strip()
@@ -669,6 +827,31 @@ def set_window_last_track_id(track_id: int | None) -> int | None:
 
     stored = int(track_id)
     settings["window_last_track_id"] = str(stored)
+    save_settings(settings)
+    return stored
+
+
+def get_window_last_folder_id() -> int | None:
+    settings = load_settings()
+    raw = settings.get("window_last_folder_id", "").strip()
+    if not raw:
+        return None
+
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def set_window_last_folder_id(folder_id: int | None) -> int | None:
+    settings = load_settings()
+    if folder_id is None:
+        settings["window_last_folder_id"] = ""
+        save_settings(settings)
+        return None
+
+    stored = int(folder_id)
+    settings["window_last_folder_id"] = str(stored)
     save_settings(settings)
     return stored
 
