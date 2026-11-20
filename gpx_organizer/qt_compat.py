@@ -9,7 +9,7 @@ from __future__ import annotations
 QT_BINDING = ""
 
 try:
-    from PyQt6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, pyqtSignal as Signal
+    from PyQt6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, QUrl, pyqtSignal as Signal
     from PyQt6.QtGui import QColor, QDrag, QIcon, QPainter, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
@@ -32,6 +32,7 @@ try:
         QMenu,
         QMessageBox,
         QProgressDialog,
+        QProgressBar,
         QPushButton,
         QSpinBox,
         QSplitter,
@@ -45,13 +46,15 @@ try:
     )
 
     try:
+        from PyQt6.QtWebEngineCore import QWebEngineSettings
         from PyQt6.QtWebEngineWidgets import QWebEngineView
     except ImportError:  # pragma: no cover - optional runtime component
         QWebEngineView = None  # type: ignore[assignment]
+        QWebEngineSettings = None  # type: ignore[assignment]
 
     QT_BINDING = "PyQt6"
 except ImportError:
-    from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
+    from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, QUrl, Signal
     from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -74,6 +77,7 @@ except ImportError:
         QMenu,
         QMessageBox,
         QProgressDialog,
+        QProgressBar,
         QPushButton,
         QSpinBox,
         QSplitter,
@@ -87,9 +91,11 @@ except ImportError:
     )
 
     try:
+        from PySide6.QtWebEngineCore import QWebEngineSettings
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except ImportError:  # pragma: no cover - optional runtime component
         QWebEngineView = None  # type: ignore[assignment]
+        QWebEngineSettings = None  # type: ignore[assignment]
 
     QT_BINDING = "PySide6"
 
@@ -119,8 +125,10 @@ __all__ = [
     "QMenu",
     "QMessageBox",
     "QMimeData",
+    "QObject",
     "QPoint",
     "QProgressDialog",
+    "QProgressBar",
     "QPainter",
     "QPixmap",
     "QPushButton",
@@ -130,10 +138,12 @@ __all__ = [
     "QStyle",
     "QTabWidget",
     "QTimer",
+    "QUrl",
     "QTreeWidget",
     "QTreeWidgetItem",
     "QVBoxLayout",
     "QWebEngineView",
+    "QWebEngineSettings",
     "QWidget",
     "Qt",
     "Signal",

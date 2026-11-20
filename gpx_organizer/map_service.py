@@ -8,7 +8,7 @@ import html
 import json
 import math
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 import re
 import xml.etree.ElementTree as ET
 
@@ -177,6 +177,8 @@ class LeafletMapService:
         | tuple[int, Path, str]
         | tuple[int, Path, str, str]
       ],
+      progress: Callable[[int, int], None] | None = None,
+      on_error: Callable[[str, str], None] | None = None,
     ) -> RenderedMap:
       """Render a lightweight overview of multiple tracks and waypoints."""
       track_count_estimate = max(1, len(tracks))
@@ -186,7 +188,9 @@ class LeafletMapService:
 
       entries: list[dict[str, object]] = []
       waypoints: list[dict[str, object]] = []
-      for track_entry in tracks:
+      for index, track_entry in enumerate(tracks):
+        if progress is not None:
+          progress(index, len(tracks))
         if len(track_entry) == 4:
           track_id, track_path, track_name, hover_label = track_entry
         elif len(track_entry) == 3:
@@ -201,6 +205,8 @@ class LeafletMapService:
           coordinates = _extract_gpx_line_coordinates(track_path)
           if len(coordinates) < 2:
             waypoint_points = _extract_gpx_waypoints(track_path)
+            if not waypoint_points and on_error is not None:
+              on_error(track_name, "No track or waypoint coordinates")
             for waypoint in waypoint_points:
               waypoints.append(
                 {
@@ -213,7 +219,9 @@ class LeafletMapService:
                 }
               )
             continue
-        except Exception:
+        except Exception as exc:
+          if on_error is not None:
+            on_error(track_name, str(exc) or type(exc).__name__)
           # Keep overview usable even if one managed GPX file is malformed.
           continue
 
@@ -227,6 +235,9 @@ class LeafletMapService:
             "coordinates": _downsample_coordinates(coordinates, max_points=points_per_track),
           }
         )
+
+      if progress is not None:
+        progress(len(tracks), len(tracks))
 
       if not entries and not waypoints:
         return self.render_placeholder(

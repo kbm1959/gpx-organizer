@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 from pathlib import Path
+import tempfile
+from threading import Event, Thread
 from typing import Callable
 from urllib.parse import parse_qs
 import webbrowser
@@ -34,10 +37,12 @@ from .qt_compat import (
     QMenu,
     QMessageBox,
     QMimeData,
+    QObject,
     QPoint,
     QPainter,
     QPixmap,
     QProgressDialog,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -45,10 +50,12 @@ from .qt_compat import (
     QStyle,
     QTabWidget,
     QTimer,
+    QUrl,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWebEngineView,
+    QWebEngineSettings,
     QWidget,
     Qt,
     Signal,
@@ -155,6 +162,16 @@ class _FolderPreviewCacheEntry:
     html: str
     track_count: int
     dirty: bool = False
+    warning: str = ""
+
+
+class _FolderPreviewSignals(QObject):
+    progress = Signal(int, int, int)
+    completed = Signal(int, int, object, int, str)
+
+
+class _PreviewCancelled(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1140,6 +1157,17 @@ class MainWindow(QMainWindow):
         self._visible_tracks: list[TrackRecord] = []
         self._preview_cache: dict[int, _FolderPreviewCacheEntry] = {}
         self._preview_cache_queue: set[int] = set()
+        self._preview_revision = 0
+        self._preview_worker_folder: int | None = None
+        self._preview_cancel = Event()
+        self._preview_signals = _FolderPreviewSignals()
+        self._preview_signals.progress.connect(self._folder_preview_progress)
+        self._preview_signals.completed.connect(self._folder_preview_completed)
+        self._map_preview_tempdir = tempfile.TemporaryDirectory(prefix="gpx-organizer-map-")
+        self._map_document_number = 0
+        self._map_load_generation = 0
+        self._folder_map_loading = False
+        self._folder_map_warning = ""
         self._folder_closed_icon = QIcon()
         self._folder_open_icon = QIcon()
         self._folder_selected_icon = QIcon()
@@ -1516,6 +1544,12 @@ class MainWindow(QMainWindow):
             web_view = QWebEngineView(container)
             web_view.installEventFilter(self)
             web_view.urlChanged.connect(self._handle_map_web_url_changed)
+            web_view.loadProgress.connect(self._folder_map_load_progress)
+            web_view.loadFinished.connect(self._folder_map_load_finished)
+            if QWebEngineSettings is not None:
+                web_view.settings().setAttribute(
+                    QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+                )
             self.map_web_view = web_view
             self._show_select_track_placeholder()
             layout.addWidget(web_view, 0, 0)
@@ -1622,6 +1656,10 @@ class MainWindow(QMainWindow):
             f"Ready - Qt: {QT_BINDING} - Map mode: {embedded}"
         )
         self.setStatusBar(status_bar)
+        self._folder_preview_progress_bar = QProgressBar(self)
+        self._folder_preview_progress_bar.setFixedWidth(180)
+        self._folder_preview_progress_bar.hide()
+        status_bar.addPermanentWidget(self._folder_preview_progress_bar)
 
     def _load_library_tree(self, selected_folder_id: int | None = None) -> None:
         if self.library_tree is None:
@@ -1704,6 +1742,11 @@ class MainWindow(QMainWindow):
             apply_icon(self.library_tree.topLevelItem(index))
 
     def _handle_current_folder_changed(self, _current=None, _previous=None) -> None:
+        if self._preview_worker_folder is not None:
+            current_id = _current.data(0, FOLDER_ID_ROLE) if _current is not None else None
+            if current_id != self._preview_worker_folder:
+                self._preview_cancel.set()
+                self._folder_preview_progress_bar.hide()
         self._refresh_folder_icons(_current, _previous)
         self._reload_track_list()
         if not self._preview_folder_track_list_enabled or _current is None:
@@ -1834,6 +1877,7 @@ class MainWindow(QMainWindow):
             self._preview_cache_queue.discard(folder_id)
 
     def _mark_preview_cache_dirty_for_ancestor_chain(self, folder_id: int) -> None:
+        self._preview_revision += 1
         current: int | None = folder_id
         while current is not None:
             entry = self._preview_cache.get(current)
@@ -1853,6 +1897,7 @@ class MainWindow(QMainWindow):
         self._schedule_preview_cache_rebuild()
 
     def _mark_all_preview_cache_dirty(self) -> None:
+        self._preview_revision += 1
         # Mark all cached entries stale, but only rebuild the currently selected
         # folder immediately. Other folders are rebuilt lazily on demand.
         for entry in self._preview_cache.values():
@@ -1874,6 +1919,8 @@ class MainWindow(QMainWindow):
         self._preview_cache_timer.start(delay_ms)
 
     def _process_preview_cache_queue(self) -> None:
+        if self._preview_worker_folder is not None:
+            return
         if not self._preview_cache_queue:
             return
         if self._defer_preview_rebuilds:
@@ -1902,7 +1949,7 @@ class MainWindow(QMainWindow):
             if self._selected_folder_id() == folder_id and not self._selected_track_ids():
                 self._set_map_html(rendered.html)
 
-        if self._preview_cache_queue:
+        if self._preview_cache_queue and self._preview_worker_folder is None:
             self._preview_cache_timer.start(120)
 
     def _mark_user_interaction_active(self) -> None:
@@ -1949,8 +1996,6 @@ class MainWindow(QMainWindow):
             track_inputs: list[tuple[int, Path, str, str]] = []
             for track in tracks:
                 managed_path = self.library_store.library_root / track.managed_rel_path
-                if not managed_path.exists():
-                    continue
                 folder_path = folder_path_by_id.get(track.folder_id, "My Library")
                 hover_label = f"{folder_path}/{track.display_name}"
                 track_inputs.append((track.id, managed_path, track.display_name, hover_label))
@@ -1968,20 +2013,94 @@ class MainWindow(QMainWindow):
             else:
                 total_input_count = len(track_inputs)
 
-                # Large folders may contain malformed entries; skip failures per entry
-                # to keep folder preview available instead of stalling the whole rebuild.
-                rendered = self.map_service.render_track_lines_preview(track_inputs)
-                self._preview_cache[folder_id] = _FolderPreviewCacheEntry(
-                    html=rendered.html,
-                    track_count=total_input_count,
-                    dirty=False,
-                )
+                self._start_folder_preview_worker(folder_id, track_inputs, total_input_count)
+                return
 
         if self._selected_folder_id() == folder_id and not self._selected_track_ids():
             self._clear_pending_folder_preview()
             entry = self._preview_cache.get(folder_id)
             if entry is not None:
-                self._set_map_html(entry.html)
+                self._set_map_html(entry.html, folder_preview=True, warning=entry.warning)
+
+    def _start_folder_preview_worker(self, folder_id: int, track_inputs: list, count: int) -> None:
+        service = copy.copy(self.map_service)
+        revision = self._preview_revision
+        cancel = Event()
+        self._preview_cancel = cancel
+        self._preview_worker_folder = folder_id
+        signals = self._preview_signals
+
+        if self._selected_folder_id() == folder_id and not self._selected_track_ids():
+            self._folder_preview_progress_bar.setRange(0, count)
+            self._folder_preview_progress_bar.setValue(0)
+            self._folder_preview_progress_bar.setFormat("Preparing preview: %v / %m")
+            self._folder_preview_progress_bar.show()
+            self.statusBar().showMessage("Preparing folder preview")
+
+        def progress(completed: int, total: int) -> None:
+            if cancel.is_set():
+                raise _PreviewCancelled()
+            signals.progress.emit(folder_id, completed, total)
+
+        def build() -> None:
+            rendered = None
+            error = ""
+            failures: list[str] = []
+            try:
+                if isinstance(service, LeafletMapService):
+                    rendered = service.render_track_lines_preview(
+                        track_inputs,
+                        progress=progress,
+                        on_error=lambda name, reason: failures.append(f"{name}: {reason}"),
+                    )
+                else:
+                    rendered = service.render_track_lines_preview(track_inputs)
+                if cancel.is_set():
+                    raise _PreviewCancelled()
+            except _PreviewCancelled:
+                error = "cancelled"
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            try:
+                signals.completed.emit(folder_id, revision, (rendered, failures), count, error)
+            except RuntimeError:
+                pass
+
+        Thread(target=build, daemon=True).start()
+
+    def _folder_preview_progress(self, folder_id: int, completed: int, total: int) -> None:
+        if self._preview_worker_folder != folder_id or self._selected_folder_id() != folder_id:
+            return
+        if self._selected_track_ids():
+            self._folder_preview_progress_bar.hide()
+            return
+        self._folder_preview_progress_bar.setRange(0, total)
+        self._folder_preview_progress_bar.setValue(completed)
+
+    def _folder_preview_completed(self, folder_id: int, revision: int, result, count: int, error: str) -> None:
+        self._preview_worker_folder = None
+        self._folder_preview_progress_bar.hide()
+        selected = self._selected_folder_id() == folder_id and not self._selected_track_ids()
+        if revision != self._preview_revision or folder_id not in self._folder_ids:
+            if selected and folder_id in self._folder_ids:
+                self._preview_cache_queue.add(folder_id)
+        elif error == "cancelled":
+            if selected:
+                self._preview_cache_queue.add(folder_id)
+        elif error:
+            if selected:
+                self._clear_pending_folder_preview()
+                self._set_map_placeholder("Folder preview failed", error)
+                self.statusBar().showMessage(f"Folder preview failed: {error}")
+        elif result[0] is not None:
+            rendered, failures = result
+            warning = f"{len(failures)} item(s) could not be rendered: {failures[0]}" if failures else ""
+            self._preview_cache[folder_id] = _FolderPreviewCacheEntry(rendered.html, count, warning=warning)
+            if selected:
+                self._clear_pending_folder_preview()
+                self._set_map_html(rendered.html, folder_preview=True, warning=warning)
+        if self._preview_cache_queue:
+            self._schedule_preview_cache_rebuild(delay_ms=1)
 
     def _find_root_folder(self, folders: list[FolderRecord]) -> FolderRecord | None:
         for folder in folders:
@@ -2122,6 +2241,10 @@ class MainWindow(QMainWindow):
         )
 
     def _schedule_preview_update(self) -> None:
+        if self._selected_track_ids():
+            self._preview_cancel.set()
+            self._preview_cache_queue.discard(self._selected_folder_id())
+            self._folder_preview_progress_bar.hide()
         # Coalesce rapid selection changes into one render to keep UI responsive.
         self._preview_update_timer.start(90)
 
@@ -2470,6 +2593,8 @@ class MainWindow(QMainWindow):
         try:
             new_store = LibraryStore(library_root=library_root.expanduser().resolve())
             new_store.initialize()
+            self._preview_revision += 1
+            self._preview_cancel.set()
             self.library_store = new_store
             self._preview_cache.clear()
             self._preview_cache_queue.clear()
@@ -2872,7 +2997,7 @@ class MainWindow(QMainWindow):
         entry = self._preview_cache.get(folder_id)
         if entry is not None:
             self._clear_pending_folder_preview()
-            self._set_map_html(entry.html)
+            self._set_map_html(entry.html, folder_preview=True, warning=entry.warning)
             self.statusBar().showMessage(
                 f"Previewing {entry.track_count} track(s) in folder view",
                 3000,
@@ -2947,19 +3072,25 @@ class MainWindow(QMainWindow):
             self._set_map_placeholder(title="Map preview failed", message=str(exc))
             QMessageBox.warning(self, "Map preview failed", str(exc))
 
-    def _set_map_html(self, html_content: str) -> None:
+    def _set_map_html(self, html_content: str, folder_preview: bool = False, warning: str = "") -> None:
+        self._map_load_generation += 1
         self._current_map_html = html_content
+        self._folder_map_loading = folder_preview
+        self._folder_map_warning = warning
 
         if self.map_web_view is not None:
             if len(html_content) > WEBENGINE_SETHTML_MAX_CHARS:
-                # QWebEngine setHtml can fail silently for very large documents
-                # because it internally uses a data URL with size limits.
-                self.map_web_view.setContent(
-                    html_content.encode("utf-8"),
-                    "text/html;charset=UTF-8",
-                )
+                self._map_document_number += 1
+                document = Path(self._map_preview_tempdir.name) / f"map-{self._map_document_number}.html"
+                document.write_text(html_content, encoding="utf-8")
+                self.map_web_view.load(QUrl.fromLocalFile(str(document)))
             else:
                 self.map_web_view.setHtml(html_content)
+            if folder_preview:
+                self._folder_preview_progress_bar.setRange(0, 0)
+                self._folder_preview_progress_bar.setFormat("Loading map...")
+                self._folder_preview_progress_bar.show()
+                self.statusBar().showMessage("Loading folder map")
             return
 
         # Fallback path: render map HTML in the system browser when WebEngine
@@ -2978,6 +3109,43 @@ class MainWindow(QMainWindow):
 
         if self.map_fallback_label is not None and self.map_web_view is None:
             self.map_fallback_label.setText(f"{title}\n\n{message}")
+
+    def _folder_map_load_progress(self, progress: int) -> None:
+        if self._folder_map_loading:
+            self._folder_preview_progress_bar.setRange(0, 100)
+            self._folder_preview_progress_bar.setValue(progress)
+            self._folder_preview_progress_bar.setFormat("Loading map: %p%")
+
+    def _folder_map_load_finished(self, success: bool) -> None:
+        if not self._folder_map_loading:
+            return
+        if not success:
+            self._folder_map_loading = False
+            self._folder_preview_progress_bar.hide()
+            self._set_map_placeholder("Folder preview failed", "The embedded map could not be loaded.")
+            self.statusBar().showMessage("Folder preview failed: the embedded map could not be loaded")
+            return
+
+        generation = self._map_load_generation
+
+        def finish(ready) -> None:
+            if generation != self._map_load_generation:
+                return
+            self._folder_map_loading = False
+            self._folder_preview_progress_bar.hide()
+            if not ready:
+                self._set_map_placeholder("Folder preview failed", "The map could not initialize. Check your connection.")
+                self.statusBar().showMessage("Folder preview failed: the map could not initialize")
+            elif self._folder_map_warning:
+                self.statusBar().showMessage(f"Folder preview incomplete: {self._folder_map_warning}")
+            else:
+                self.statusBar().showMessage("Folder map loaded", 5000)
+
+        self.map_web_view.page().runJavaScript(
+            "!document.getElementById('map') || "
+            "(typeof L !== 'undefined' && typeof window.__gpxFitTrack === 'function')",
+            finish,
+        )
 
     def _write_current_map_preview(self) -> Path:
         preview_dir = get_app_paths().base_dir / "previews"
@@ -3164,6 +3332,8 @@ class MainWindow(QMainWindow):
             self.map_service.track_point_size_px = saved_track_point_size_px
 
         # Force style recalculation for all folder-level previews (root and subfolders).
+        self._preview_revision += 1
+        self._preview_cancel.set()
         self._preview_cache.clear()
         self._preview_cache_queue.clear()
 
@@ -4152,6 +4322,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # pragma: no cover - GUI behavior
+        self._preview_cancel.set()
         if self._keep_window_configuration_enabled:
             set_window_size(self.width(), self.height())
             if self._main_splitter is not None:

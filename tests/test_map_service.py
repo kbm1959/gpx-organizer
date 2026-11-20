@@ -177,6 +177,34 @@ def test_render_track_lines_preview_contains_each_track_entry(tmp_path: Path) ->
     assert "window.__gpxFitTrack = function()" in rendered.html
 
 
+def test_folder_preview_progress_counts_skipped_files(tmp_path: Path) -> None:
+    track = tmp_path / "track.gpx"
+    track.write_text(SAMPLE_GPX, encoding="utf-8")
+    updates: list[tuple[int, int]] = []
+    failures: list[str] = []
+
+    rendered = LeafletMapService().render_track_lines_preview(
+        [(1, track, "Track"), (2, tmp_path / "missing.gpx", "Missing")],
+        progress=lambda completed, total: updates.append((completed, total)),
+        on_error=lambda name, reason: failures.append(name),
+    )
+
+    assert updates == [(0, 2), (1, 2), (2, 2)]
+    assert failures == ["Missing"]
+    assert '"trackId": 1' in rendered.html
+
+
+def test_large_folder_preview_keeps_all_items(tmp_path: Path) -> None:
+    track = tmp_path / "track.gpx"
+    track.write_text(SAMPLE_GPX, encoding="utf-8")
+    tracks = [(index, track, f"Track {index}") for index in range(500)]
+
+    rendered = LeafletMapService().render_track_lines_preview(tracks)
+
+    for index in range(500):
+        assert f'"trackId": {index},' in rendered.html
+
+
 def test_render_waypoint_contains_marker_and_title(tmp_path: Path) -> None:
     waypoint_path = tmp_path / "waypoint.gpx"
     waypoint_path.write_text(WAYPOINT_GPX, encoding="utf-8")
