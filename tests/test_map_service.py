@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import base64
 import pytest
 
 from gpx_organizer.map_service import LeafletMapService, TRACK_RENDER_MAX_POINTS
@@ -35,6 +36,10 @@ WAYPOINT_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
     </wpt>
 </gpx>
 """
+
+
+def _default_tray(store: LibraryStore) -> int:
+    return store.create_tray("Test tray", store.get_root_folder_id())
 
 
 def test_render_track_contains_leaflet_and_track_name(tmp_path: Path) -> None:
@@ -217,7 +222,7 @@ def test_folder_preview_cache_survives_restart_and_invalidates_edits(tmp_path: P
     source.write_text(SAMPLE_GPX, encoding="utf-8")
     store = LibraryStore(tmp_path / "library")
     store.initialize()
-    imported = store.import_gpx(source)
+    imported = store.import_gpx(source, target_folder_id=_default_tray(store))
     service = LeafletMapService()
     parse = map_service.ET.parse
     parsed: list[Path] = []
@@ -276,7 +281,7 @@ def test_folder_preview_cache_stores_waypoints(tmp_path: Path, monkeypatch) -> N
     source.write_text(WAYPOINT_GPX, encoding="utf-8")
     store = LibraryStore(tmp_path / "library")
     store.initialize()
-    imported = store.import_gpx_all(source)[0]
+    imported = store.import_gpx_all(source, target_folder_id=_default_tray(store))[0]
     service = LeafletMapService()
     inputs = [(imported.track_id, imported.managed_path, "Home Pin")]
     with store.preview_data_cache() as cache:
@@ -292,7 +297,7 @@ def test_folder_preview_renders_when_cache_is_unavailable(tmp_path: Path) -> Non
     source.write_text(SAMPLE_GPX, encoding="utf-8")
     store = LibraryStore(tmp_path / "library")
     store.initialize()
-    track = store.import_gpx(source)
+    track = store.import_gpx(source, target_folder_id=_default_tray(store))
     with store._connect() as conn:
         conn.execute("DROP TABLE preview_data_cache")
 
@@ -324,6 +329,29 @@ def test_render_waypoint_contains_marker_and_title(tmp_path: Path) -> None:
     assert rendered.title == "Home Pin"
     assert "circleMarker" in rendered.html
     assert "Home" in rendered.html
+
+
+def test_waypoint_map_uses_svg_from_any_working_directory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    waypoint_path = tmp_path / "waypoint.gpx"
+    waypoint_path.write_text(WAYPOINT_GPX, encoding="utf-8")
+    rendered = LeafletMapService().render_waypoint(waypoint_path, "Home")
+    assert "data:image/svg+xml;base64," in rendered.html
+
+
+def test_waypoint_map_prefers_svg_and_supports_custom_png(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    icon_dir = tmp_path / "icons"
+    icon_dir.mkdir()
+    (icon_dir / "map-waypoint.png").write_bytes(b"custom png")
+    assert map_service._load_waypoint_icon_data_url() == (
+        "data:image/png;base64," + base64.b64encode(b"custom png").decode("ascii")
+    )
+    vector = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+    (icon_dir / "map-waypoint.svg").write_bytes(vector)
+    assert map_service._load_waypoint_icon_data_url() == (
+        "data:image/svg+xml;base64," + base64.b64encode(vector).decode("ascii")
+    )
 
 
 def test_render_track_lines_preview_includes_waypoints(tmp_path: Path) -> None:

@@ -2059,19 +2059,22 @@ def _extract_gpx_waypoints(track_path: Path, root: ET.Element | None = None) -> 
 
 
 def _load_waypoint_icon_data_url() -> str | None:
-    icon_paths = [
-        Path.cwd() / "gpx_organizer" / "icons" / "map-waypoint.png",
-        Path.cwd() / "icons" / "map-waypoint.png",
+  icon_dirs = [
+    Path.cwd() / "gpx_organizer" / "icons",
+    Path.cwd() / "icons",
+    Path(__file__).resolve().parent / "icons",
     ]
-    for icon_path in icon_paths:
-        if not icon_path.is_file():
-            continue
-        try:
-            encoded = base64.b64encode(icon_path.read_bytes()).decode("ascii")
-            return f"data:image/png;base64,{encoded}"
-        except Exception:
-            continue
-    return None
+  for icon_dir in icon_dirs:
+    for suffix, mime in (("svg", "image/svg+xml"), ("png", "image/png")):
+      icon_path = icon_dir / f"map-waypoint.{suffix}"
+      if not icon_path.is_file():
+        continue
+      try:
+        encoded = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+      except OSError:
+        continue
+  return None
 
 
 def _downsample_coordinates(

@@ -13,7 +13,7 @@ Some `PySide6` wheels on arm64 require `libwebp.so.6`, while Bookworm ships
 
 ```bash
 sudo apt update
-sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine qt6-webengine-dev-tools
+sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine qt6-webengine-dev-tools librsvg2-bin
 ```
 
 2. Create a venv that can use system Python packages:
@@ -42,3 +42,5 @@ python gpx_organizer_main.py
 - Do not symlink `libwebp.so.6` to `libwebp.so.7`.
 - Do not downgrade core system multimedia libraries.
 - If embedded map is unavailable, app will still open previews in your default browser.
+- SVG icons use Qt's SVG support when available, or `rsvg-convert` from
+	`librsvg2-bin` otherwise. Existing PNG icons remain as a fallback.

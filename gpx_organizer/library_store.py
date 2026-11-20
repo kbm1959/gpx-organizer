@@ -170,6 +170,7 @@ class LibraryStore:
                     parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
                     name TEXT NOT NULL,
                     kind TEXT NOT NULL CHECK (kind IN ('root', 'normal', 'trash')),
+                    is_tray INTEGER NOT NULL DEFAULT 0 CHECK (is_tray IN (0, 1)),
                     position INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -222,6 +223,12 @@ class LibraryStore:
                     """
                 )
 
+            folder_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(folders)")}
+            if "is_tray" not in folder_columns:
+                conn.execute("BEGIN")
+                conn.execute("ALTER TABLE folders ADD COLUMN is_tray INTEGER NOT NULL DEFAULT 0")
+                self._migrate_existing_trays(conn)
+
             now = _utc_now_iso()
             root_row = conn.execute(
                 "SELECT id FROM folders WHERE kind = 'root' LIMIT 1"
@@ -250,12 +257,38 @@ class LibraryStore:
                     (root_id, "Trash", now, now),
                 )
 
+    def _migrate_existing_trays(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """SELECT f.id, f.kind,
+                      EXISTS(SELECT 1 FROM folders child WHERE child.parent_id = f.id) AS has_children
+               FROM folders f
+               WHERE f.kind != 'trash' AND EXISTS(SELECT 1 FROM tracks t WHERE t.folder_id = f.id)"""
+        ).fetchall()
+        for row in rows:
+            folder_id = int(row["id"])
+            if row["kind"] == "normal" and not row["has_children"]:
+                conn.execute("UPDATE folders SET is_tray = 1 WHERE id = ?", (folder_id,))
+                continue
+            name = "Items"
+            number = 1
+            while self._sibling_name_exists(conn, folder_id, name):
+                name = f"Items ({number})"
+                number += 1
+            now = _utc_now_iso()
+            cursor = conn.execute(
+                """INSERT INTO folders(parent_id, name, kind, is_tray, position, created_at, updated_at)
+                   VALUES (?, ?, 'normal', 1, 0, ?, ?)""",
+                (folder_id, name, now, now),
+            )
+            conn.execute("UPDATE tracks SET folder_id = ? WHERE folder_id = ?", (cursor.lastrowid, folder_id))
+
     def list_folders(self) -> list[FolderRecord]:
         """Return all folders for tree rendering."""
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, parent_id, name, kind, position
+                  SELECT id, parent_id, name,
+                      CASE WHEN is_tray = 1 THEN 'tray' ELSE kind END AS kind, position
                 FROM folders
                 ORDER BY
                     CASE kind WHEN 'root' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
@@ -347,19 +380,22 @@ class LibraryStore:
 
     def create_folder(self, name: str, parent_id: int) -> int:
         """Create a new normal folder under parent_id and return its id."""
+        return self._create_folder_or_tray(name, parent_id, is_tray=False)
+
+    def create_tray(self, name: str, parent_id: int) -> int:
+        """Create a tray under a folder and return its id."""
+        return self._create_folder_or_tray(name, parent_id, is_tray=True)
+
+    def _create_folder_or_tray(self, name: str, parent_id: int, is_tray: bool) -> int:
         cleaned = _clean_folder_name(name)
         now = _utc_now_iso()
 
         with self._connect() as conn:
-            parent = conn.execute(
-                "SELECT id FROM folders WHERE id = ?",
-                (parent_id,),
-            ).fetchone()
-            if parent is None:
-                raise ValueError(f"Parent folder id {parent_id} not found")
+            self._require_folder_destination(conn, parent_id)
 
-            if self._sibling_name_exists(conn, parent_id=parent_id, name=cleaned):
-                raise ValueError(f"A folder named '{cleaned}' already exists in this location")
+            if self._sibling_name_exists(conn, parent_id=parent_id, name=cleaned, is_tray=is_tray):
+                label = "tray" if is_tray else "folder"
+                raise ValueError(f"A {label} named '{cleaned}' already exists in this location")
 
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM folders WHERE parent_id = ?",
@@ -368,12 +404,36 @@ class LibraryStore:
             next_pos = int(row["next_pos"])
             conn.execute(
                 """
-                INSERT INTO folders(parent_id, name, kind, position, created_at, updated_at)
-                VALUES (?, ?, 'normal', ?, ?, ?)
+                INSERT INTO folders(parent_id, name, kind, is_tray, position, created_at, updated_at)
+                VALUES (?, ?, 'normal', ?, ?, ?, ?)
                 """,
-                (parent_id, cleaned, next_pos, now, now),
+                (parent_id, cleaned, int(is_tray), next_pos, now, now),
             )
             return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    def convert_tray_to_folder(self, tray_id: int, reserved_names: set[str] | None = None) -> int:
+        """Turn a tray into a folder, retaining its contents in an Items tray."""
+        with self._connect() as conn:
+            self._require_tray_destination(conn, tray_id)
+            tray = conn.execute("SELECT parent_id, name FROM folders WHERE id = ?", (tray_id,)).fetchone()
+            if self._sibling_name_exists(conn, tray["parent_id"], str(tray["name"]), is_tray=False):
+                raise ValueError(f"A folder named '{tray['name']}' already exists in this location")
+            now = _utc_now_iso()
+            reserved = {name.casefold() for name in (reserved_names or set())}
+            name = "Items"
+            number = 1
+            while name.casefold() in reserved or self._sibling_name_exists(conn, tray_id, name):
+                name = f"Items ({number})"
+                number += 1
+            cursor = conn.execute(
+                """INSERT INTO folders(parent_id, name, kind, is_tray, position, created_at, updated_at)
+                   VALUES (?, ?, 'normal', 1, 0, ?, ?)""",
+                (tray_id, name, now, now),
+            )
+            child_id = int(cursor.lastrowid)
+            conn.execute("UPDATE tracks SET folder_id = ? WHERE folder_id = ?", (child_id, tray_id))
+            conn.execute("UPDATE folders SET is_tray = 0, updated_at = ? WHERE id = ?", (now, tray_id))
+            return child_id
 
     def rename_folder(self, folder_id: int, new_name: str) -> FolderRecord:
         """Rename a normal folder."""
@@ -381,7 +441,7 @@ class LibraryStore:
 
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, parent_id, name, kind, position FROM folders WHERE id = ?",
+                "SELECT id, parent_id, name, CASE WHEN is_tray = 1 THEN 'tray' ELSE kind END AS kind, position FROM folders WHERE id = ?",
                 (folder_id,),
             ).fetchone()
             if row is None:
@@ -403,8 +463,9 @@ class LibraryStore:
                 parent_id=current.parent_id,
                 name=cleaned,
                 exclude_folder_id=current.id,
+                is_tray=current.kind == "tray",
             ):
-                raise ValueError(f"A folder named '{cleaned}' already exists in this location")
+                raise ValueError(f"A {current.kind if current.kind == 'tray' else 'folder'} named '{cleaned}' already exists in this location")
 
             conn.execute(
                 "UPDATE folders SET name = ?, updated_at = ? WHERE id = ?",
@@ -475,7 +536,7 @@ class LibraryStore:
 
         with self._connect() as conn:
             moving_row = conn.execute(
-                "SELECT id, parent_id, name, kind, position FROM folders WHERE id = ?",
+                "SELECT id, parent_id, name, kind, is_tray, position FROM folders WHERE id = ?",
                 (folder_id,),
             ).fetchone()
             if moving_row is None:
@@ -485,12 +546,7 @@ class LibraryStore:
             if moving_kind in {"root", "trash"}:
                 raise ValueError("Root and Trash folders cannot be moved")
 
-            target_row = conn.execute(
-                "SELECT id, kind FROM folders WHERE id = ?",
-                (new_parent_id,),
-            ).fetchone()
-            if target_row is None:
-                raise ValueError(f"Target parent folder id {new_parent_id} not found")
+            self._require_folder_destination(conn, new_parent_id)
 
             if int(moving_row["id"]) == new_parent_id:
                 raise ValueError("Cannot move a folder into itself")
@@ -509,9 +565,11 @@ class LibraryStore:
                 parent_id=new_parent_id,
                 name=str(moving_row["name"]),
                 exclude_folder_id=folder_id,
+                is_tray=bool(moving_row["is_tray"]),
             ):
+                label = "tray" if moving_row["is_tray"] else "folder"
                 raise ValueError(
-                    "Target location already has a folder with the same name"
+                    f"Target location already has a {label} with the same name"
                 )
 
             row = conn.execute(
@@ -532,9 +590,7 @@ class LibraryStore:
     def move_track_to_folder(self, track_id: int, folder_id: int) -> None:
         """Move a track to another folder."""
         with self._connect() as conn:
-            target = conn.execute("SELECT id FROM folders WHERE id = ?", (folder_id,)).fetchone()
-            if target is None:
-                raise ValueError(f"Folder id {folder_id} not found")
+            self._require_tray_destination(conn, folder_id)
 
             updated = conn.execute(
                 "UPDATE tracks SET folder_id = ?, updated_at = ? WHERE id = ?",
@@ -549,9 +605,7 @@ class LibraryStore:
             return []
 
         with self._connect() as conn:
-            target = conn.execute("SELECT id FROM folders WHERE id = ?", (folder_id,)).fetchone()
-            if target is None:
-                raise ValueError(f"Folder id {folder_id} not found")
+            self._require_tray_destination(conn, folder_id)
 
             copied: list[TrackRecord] = []
             for item_id in item_ids:
@@ -614,18 +668,13 @@ class LibraryStore:
             if str(source_row["kind"]) in {"root", "trash"}:
                 raise ValueError("Root and Trash folders cannot be copied")
 
-            target_row = conn.execute(
-                "SELECT id FROM folders WHERE id = ?",
-                (new_parent_id,),
-            ).fetchone()
-            if target_row is None:
-                raise ValueError(f"Target parent folder id {new_parent_id} not found")
+            self._require_folder_destination(conn, new_parent_id)
 
             folder_ids = self._collect_subtree_ids(conn, folder_id)
             folder_rows = {
                 int(row["id"]): row
                 for row in conn.execute(
-                    "SELECT id, parent_id, name, kind FROM folders WHERE id IN ({})".format(
+                    "SELECT id, parent_id, name, kind, is_tray FROM folders WHERE id IN ({})".format(
                         ",".join("?" for _ in folder_ids)
                     ),
                     tuple(folder_ids),
@@ -643,7 +692,9 @@ class LibraryStore:
 
                 if old_folder_id == folder_id:
                     parent_id = new_parent_id
-                    folder_name = _build_copy_folder_name(conn, parent_id=parent_id, source_name=source_name)
+                    folder_name = _build_copy_folder_name(
+                        conn, parent_id=parent_id, source_name=source_name, is_tray=bool(row["is_tray"])
+                    )
                 else:
                     if old_parent is None or old_parent not in id_map:
                         raise ValueError("Folder copy failed due to inconsistent subtree")
@@ -658,10 +709,10 @@ class LibraryStore:
 
                 conn.execute(
                     """
-                    INSERT INTO folders(parent_id, name, kind, position, created_at, updated_at)
-                    VALUES (?, ?, 'normal', ?, ?, ?)
+                    INSERT INTO folders(parent_id, name, kind, is_tray, position, created_at, updated_at)
+                    VALUES (?, ?, 'normal', ?, ?, ?, ?)
                     """,
-                    (parent_id, folder_name, next_pos, now, now),
+                    (parent_id, folder_name, int(row["is_tray"]), next_pos, now, now),
                 )
                 new_folder_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
                 id_map[old_folder_id] = new_folder_id
@@ -729,6 +780,10 @@ class LibraryStore:
         target_folder_id: int | None = None,
     ) -> list[ImportResult]:
         """Import all <trk> and <wpt> entries from a GPX file as separate managed files."""
+        if target_folder_id is None:
+            raise ValueError("Select a tray before importing GPX items")
+        with self._connect() as conn:
+            self._require_tray_destination(conn, target_folder_id)
         source = source_path.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"GPX file not found: {source}")
@@ -743,7 +798,7 @@ class LibraryStore:
         imported: list[ImportResult] = []
 
         with self._connect() as conn:
-            folder_id = target_folder_id if target_folder_id is not None else self.get_root_folder_id()
+            folder_id = target_folder_id
 
             for idx, entry in enumerate(import_entries, start=1):
                 file_hash = hashlib.sha256(entry.gpx_bytes).hexdigest()
@@ -827,7 +882,7 @@ class LibraryStore:
         """Load a folder by id."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, parent_id, name, kind, position FROM folders WHERE id = ?",
+                "SELECT id, parent_id, name, CASE WHEN is_tray = 1 THEN 'tray' ELSE kind END AS kind, position FROM folders WHERE id = ?",
                 (folder_id,),
             ).fetchone()
             if row is None:
@@ -1511,6 +1566,20 @@ class LibraryStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _require_folder_destination(self, conn: sqlite3.Connection, folder_id: int) -> None:
+        row = conn.execute("SELECT kind, is_tray FROM folders WHERE id = ?", (folder_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Folder id {folder_id} not found")
+        if row["kind"] == "trash" or row["is_tray"]:
+            raise ValueError("Folders and trays can only be placed inside folders")
+
+    def _require_tray_destination(self, conn: sqlite3.Connection, folder_id: int) -> None:
+        row = conn.execute("SELECT kind, is_tray FROM folders WHERE id = ?", (folder_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Folder id {folder_id} not found")
+        if row["kind"] != "normal" or not row["is_tray"]:
+            raise ValueError("Tracks and waypoints can only be placed inside trays")
+
     def _collect_subtree_ids(self, conn: sqlite3.Connection, root_id: int) -> list[int]:
         children_map: dict[int | None, list[int]] = {}
         rows = conn.execute("SELECT id, parent_id FROM folders").fetchall()
@@ -1553,6 +1622,7 @@ class LibraryStore:
         parent_id: int | None,
         name: str,
         exclude_folder_id: int | None = None,
+        is_tray: bool | None = None,
     ) -> bool:
         if parent_id is None:
             query = "SELECT id FROM folders WHERE parent_id IS NULL AND lower(name) = lower(?)"
@@ -1560,6 +1630,10 @@ class LibraryStore:
         else:
             query = "SELECT id FROM folders WHERE parent_id = ? AND lower(name) = lower(?)"
             params = [parent_id, name]
+
+        if is_tray is not None:
+            query += " AND is_tray = ?"
+            params.append(int(is_tray))
 
         if exclude_folder_id is not None:
             query += " AND id != ?"
@@ -1663,10 +1737,10 @@ def _build_copy_track_display_name(
         copy_number += 1
 
 
-def _build_copy_folder_name(conn: sqlite3.Connection, parent_id: int, source_name: str) -> str:
+def _build_copy_folder_name(conn: sqlite3.Connection, parent_id: int, source_name: str, is_tray: bool) -> str:
     rows = conn.execute(
-        "SELECT name FROM folders WHERE parent_id = ?",
-        (parent_id,),
+        "SELECT name FROM folders WHERE parent_id = ? AND is_tray = ?",
+        (parent_id, int(is_tray)),
     ).fetchall()
     existing = {str(row["name"]).lower() for row in rows}
 

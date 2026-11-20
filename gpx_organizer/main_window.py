@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import copy
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 from threading import Event, Thread
 from typing import Callable
@@ -197,7 +199,9 @@ class FolderTreeWidget(QTreeWidget):
         self._folder_closed_icon = QIcon()
         self._folder_open_icon = QIcon()
         self._folder_selected_icon = QIcon()
+        self._folder_open_selected_icon = QIcon()
         self._folder_hover_icon = QIcon()
+        self._tray_icon = QIcon()
         self._drag_preview_opacity = 0.9
 
     def set_drag_preview_opacity(self, opacity: float) -> None:
@@ -209,12 +213,16 @@ class FolderTreeWidget(QTreeWidget):
         closed_icon: QIcon,
         open_icon: QIcon,
         selected_icon: QIcon,
+        open_selected_icon: QIcon,
         hover_icon: QIcon,
+        tray_icon: QIcon,
     ) -> None:
         self._folder_closed_icon = closed_icon
         self._folder_open_icon = open_icon
         self._folder_selected_icon = selected_icon
+        self._folder_open_selected_icon = open_selected_icon
         self._folder_hover_icon = hover_icon
+        self._tray_icon = tray_icon
 
     def drop_hover_item(self) -> QTreeWidgetItem | None:
         return self._drop_hover_item
@@ -223,8 +231,12 @@ class FolderTreeWidget(QTreeWidget):
         return not icon.isNull()
 
     def _preferred_icon_for_item(self, item: QTreeWidgetItem) -> QIcon:
+        if item.data(0, FOLDER_KIND_ROLE) == "tray":
+            return self._tray_icon
         if item is self._drop_hover_item and self._icon_is_renderable(self._folder_hover_icon):
             return self._folder_hover_icon
+        if item is self.currentItem() and item.isExpanded() and self._icon_is_renderable(self._folder_open_selected_icon):
+            return self._folder_open_selected_icon
         if item is self.currentItem() and self._icon_is_renderable(self._folder_selected_icon):
             return self._folder_selected_icon
         if item.isExpanded():
@@ -360,12 +372,17 @@ class FolderTreeWidget(QTreeWidget):
 
     def dragMoveEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         if event.mimeData().hasUrls():
-            self._set_drop_hover_item(self.itemAt(event.position().toPoint()))
+            target_item = self.itemAt(event.position().toPoint())
+            if target_item is None or target_item.data(0, FOLDER_KIND_ROLE) != "tray":
+                self._set_drop_hover_item(None)
+                event.ignore()
+                return
+            self._set_drop_hover_item(target_item)
             event.acceptProposedAction()
             return
         if event.mimeData().hasFormat(TRACK_IDS_MIME):
             target_item = self.itemAt(event.position().toPoint())
-            if target_item is None:
+            if target_item is None or target_item.data(0, FOLDER_KIND_ROLE) != "tray":
                 self._set_drop_hover_item(None)
                 event.ignore()
                 return
@@ -401,7 +418,7 @@ class FolderTreeWidget(QTreeWidget):
 
         if event.mimeData().hasFormat(FOLDER_ID_MIME):
             target_item = self.itemAt(event.position().toPoint())
-            if target_item is None:
+            if target_item is None or target_item.data(0, FOLDER_KIND_ROLE) not in {"normal", "root"}:
                 self._set_drop_hover_item(None)
                 event.ignore()
                 return
@@ -448,6 +465,10 @@ class FolderTreeWidget(QTreeWidget):
                 event.ignore()
                 return
 
+            if target_item.data(0, FOLDER_KIND_ROLE) != "tray":
+                event.ignore()
+                return
+
             target_folder_id = target_item.data(0, FOLDER_ID_ROLE)
             if target_folder_id is None:
                 event.ignore()
@@ -469,7 +490,7 @@ class FolderTreeWidget(QTreeWidget):
 
         target_item = self.itemAt(event.position().toPoint())
         if event.mimeData().hasFormat(TRACK_IDS_MIME):
-            if target_item is None:
+            if target_item is None or target_item.data(0, FOLDER_KIND_ROLE) != "tray":
                 event.ignore()
                 return
 
@@ -510,7 +531,7 @@ class FolderTreeWidget(QTreeWidget):
             return
 
         if event.mimeData().hasFormat(FOLDER_ID_MIME):
-            if target_item is None:
+            if target_item is None or target_item.data(0, FOLDER_KIND_ROLE) not in {"normal", "root"}:
                 event.ignore()
                 return
 
@@ -1171,7 +1192,9 @@ class MainWindow(QMainWindow):
         self._folder_closed_icon = QIcon()
         self._folder_open_icon = QIcon()
         self._folder_selected_icon = QIcon()
+        self._folder_open_selected_icon = QIcon()
         self._folder_hover_icon = QIcon()
+        self._tray_icon = QIcon()
         self._track_item_icon = QIcon()
         self._waypoint_item_icon = QIcon()
         self._clipboard_payload: _ClipboardPayload | None = None
@@ -1247,8 +1270,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._import_action = file_menu.addAction("Import GPX")
         self._import_action.triggered.connect(self._import_gpx_into_selected_folder)
-        import_folder_tree_action = file_menu.addAction("Import Folder Tree...")
-        import_folder_tree_action.triggered.connect(self._import_folder_tree_into_library)
+        self._import_folder_tree_action = file_menu.addAction("Import Folder Tree as Sibling...")
+        self._import_folder_tree_action.triggered.connect(self._import_folder_tree_into_library)
         export_action = file_menu.addAction("Export GPX")
         export_action.triggered.connect(self._export_selected_track)
         file_menu.addSeparator()
@@ -1345,6 +1368,7 @@ class MainWindow(QMainWindow):
         folders_layout.setSpacing(6)
 
         tree = FolderTreeWidget(container)
+        tree.setStyleSheet("QTreeWidget::item:selected { background: #d3e6f4; color: #172f42; }")
         tree.setHeaderLabel("Folders")
         tree.setDragEnabled(True)
         tree.setAcceptDrops(True)
@@ -1362,7 +1386,9 @@ class MainWindow(QMainWindow):
             closed_icon=self._folder_closed_icon,
             open_icon=self._folder_open_icon,
             selected_icon=self._folder_selected_icon,
+            open_selected_icon=self._folder_open_selected_icon,
             hover_icon=self._folder_hover_icon,
+            tray_icon=self._tray_icon,
         )
         tree.set_drag_preview_opacity(self._drag_preview_opacity_percent / 100.0)
         self.library_tree = tree
@@ -1378,6 +1404,7 @@ class MainWindow(QMainWindow):
         tracks_title.setObjectName("panelSubTitle")
 
         track_list = TrackListWidget(container)
+        track_list.setStyleSheet("QListWidget::item:selected { background: #d3e6f4; color: #172f42; }")
         track_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         track_list.setDragEnabled(True)
         track_list.setAcceptDrops(False)
@@ -1466,12 +1493,14 @@ class MainWindow(QMainWindow):
         )
 
         icon_overrides = {
-            "folder_closed": ["folder-closed.svg", "folder-closed.png", "folder_closed.svg", "folder_closed.png"],
-            "folder_open": ["folder-open.svg", "folder-open.png", "folder_open.svg", "folder_open.png"],
-            "folder_selected": ["folder_selected.png", "folder-selected.png", "folder_selected.svg", "folder-selected.svg"],
-            "folder_hover": ["folder-hover.png", "folder_hover.png", "folder-hover.svg", "folder_hover.svg"],
+            "folder_closed": ["folder-closed.svg", "folder_closed.svg", "folder-closed.png", "folder_closed.png"],
+            "folder_open": ["folder-open.svg", "folder_open.svg", "folder-open.png", "folder_open.png"],
+            "folder_selected": ["folder_selected.svg", "folder-selected.svg", "folder_selected.png", "folder-selected.png"],
+            "folder_open_selected": ["folder-open-selected.svg", "folder_open_selected.svg", "folder-open-selected.png", "folder_open_selected.png"],
+            "folder_hover": ["folder-hover.svg", "folder_hover.svg", "folder-hover.png", "folder_hover.png"],
             "track": ["track.svg", "track.png"],
-            "waypoint": ["map-pin.svg", "map-pin.png", "waypoint.svg", "waypoint.png"],
+            "waypoint": ["map-pin.svg", "waypoint.svg", "map-pin.png", "waypoint.png"],
+            "tray": ["tray.svg", "tray.png"],
         }
 
         for base_dir in self._candidate_icon_dirs():
@@ -1487,6 +1516,10 @@ class MainWindow(QMainWindow):
             if folder_selected_icon is not None:
                 self._folder_selected_icon = folder_selected_icon
 
+            folder_open_selected_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_open_selected"])
+            if folder_open_selected_icon is not None:
+                self._folder_open_selected_icon = folder_open_selected_icon
+
             folder_hover_icon = self._load_icon_candidate(base_dir, icon_overrides["folder_hover"])
             if folder_hover_icon is not None:
                 self._folder_hover_icon = folder_hover_icon
@@ -1499,6 +1532,10 @@ class MainWindow(QMainWindow):
             if waypoint_icon is not None:
                 self._waypoint_item_icon = waypoint_icon
 
+            tray_icon = self._load_icon_candidate(base_dir, icon_overrides["tray"])
+            if tray_icon is not None:
+                self._tray_icon = tray_icon
+
     def _best_icon(self, *candidates: QIcon) -> QIcon:
         for icon in candidates:
             if self._is_icon_renderable(icon):
@@ -1507,11 +1544,13 @@ class MainWindow(QMainWindow):
 
     def _candidate_icon_dirs(self) -> list[Path]:
         app_icon_dir = get_app_paths().base_dir / "icons"
-        return [
+        icon_dirs = [
+            Path(__file__).resolve().parent / "icons",
             Path.cwd() / "gpx_organizer" / "icons",
             Path.cwd() / "icons",
             app_icon_dir,
         ]
+        return list(dict.fromkeys(icon_dir.resolve() for icon_dir in icon_dirs))
 
     def _load_icon_candidate(self, base_dir: Path, names: list[str]) -> QIcon | None:
         for name in names:
@@ -1521,6 +1560,19 @@ class MainWindow(QMainWindow):
             icon = QIcon(str(icon_path))
             if self._is_icon_renderable(icon):
                 return icon
+            if icon_path.suffix.lower() == ".svg":
+                converter = shutil.which("rsvg-convert")
+                if converter is not None:
+                    try:
+                        result = subprocess.run(
+                            [converter, "--width", "64", "--height", "64", str(icon_path)],
+                            capture_output=True, check=True, timeout=5,
+                        )
+                        pixmap = QPixmap()
+                        if pixmap.loadFromData(result.stdout, "PNG"):
+                            return QIcon(pixmap)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
         return None
 
     def _is_icon_renderable(self, icon: QIcon) -> bool:
@@ -1674,7 +1726,7 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem([folder.name])
             item.setData(0, FOLDER_ID_ROLE, folder.id)
             item.setData(0, FOLDER_KIND_ROLE, folder.kind)
-            item.setIcon(0, self._folder_closed_icon)
+            item.setIcon(0, self._tray_icon if folder.kind == "tray" else self._folder_closed_icon)
 
             flags = item.flags() | Qt.ItemFlag.ItemIsDropEnabled
             if folder.kind in {"root", "trash"}:
@@ -1722,18 +1774,8 @@ class MainWindow(QMainWindow):
         if self.library_tree is None:
             return
 
-        current_item = self.library_tree.currentItem()
-        hover_item = self.library_tree.drop_hover_item()
-
         def apply_icon(item: QTreeWidgetItem) -> None:
-            if item is hover_item and self._is_icon_renderable(self._folder_hover_icon):
-                item.setIcon(0, self._folder_hover_icon)
-            elif item is current_item and self._is_icon_renderable(self._folder_selected_icon):
-                item.setIcon(0, self._folder_selected_icon)
-            elif item.isExpanded():
-                item.setIcon(0, self._folder_open_icon)
-            else:
-                item.setIcon(0, self._folder_closed_icon)
+            self.library_tree._apply_folder_icon(item)
 
             for idx in range(item.childCount()):
                 apply_icon(item.child(idx))
@@ -1742,6 +1784,9 @@ class MainWindow(QMainWindow):
             apply_icon(self.library_tree.topLevelItem(index))
 
     def _handle_current_folder_changed(self, _current=None, _previous=None) -> None:
+        kind = _current.data(0, FOLDER_KIND_ROLE) if _current is not None else None
+        self._import_action.setEnabled(kind == "tray")
+        self._import_folder_tree_action.setEnabled(kind == "tray")
         if self._preview_worker_folder is not None:
             current_id = _current.data(0, FOLDER_ID_ROLE) if _current is not None else None
             if current_id != self._preview_worker_folder:
@@ -1980,7 +2025,11 @@ class MainWindow(QMainWindow):
 
         self._set_map_delete_behavior(self._folder_kind_by_id.get(folder_id) == "trash")
 
-        tracks = self.library_store.list_tracks_recursive(folder_id)
+        tracks = (
+            self.library_store.list_tracks(folder_id)
+            if self._folder_kind_by_id.get(folder_id) == "tray"
+            else self.library_store.list_tracks_recursive(folder_id)
+        )
         if not tracks:
             rendered = self.map_service.render_placeholder(
                 title="Map Preview",
@@ -2154,7 +2203,11 @@ class MainWindow(QMainWindow):
             )
             return
 
-        tracks = self.library_store.list_tracks_recursive(folder_id)
+        tracks = (
+            self.library_store.list_tracks(folder_id)
+            if folder_kind == "tray"
+            else self.library_store.list_tracks_recursive(folder_id)
+        )
 
         def sort_key(track: TrackRecord) -> tuple[int, str, int]:
             return (
@@ -2271,6 +2324,8 @@ class MainWindow(QMainWindow):
         return imported_count, duplicate_count, failures
 
     def _import_gpx_into_selected_folder(self) -> None:
+        if self._selected_folder_kind() != "tray":
+            return
         selected_files, _ = QFileDialog.getOpenFileNames(
             self,
             "Import GPX Files",
@@ -2300,6 +2355,8 @@ class MainWindow(QMainWindow):
             )
 
     def _import_folder_tree_into_library(self) -> None:
+        if self._selected_folder_kind() != "tray":
+            return
         selected_dir = QFileDialog.getExistingDirectory(
             self,
             "Import Folder Tree",
@@ -2388,16 +2445,20 @@ class MainWindow(QMainWindow):
         progress_dialog: QProgressDialog | None = None,
     ) -> tuple[int, int, int, list[str], int, bool, int]:
         folders = self.library_store.list_folders()
-        children_by_parent: dict[int, dict[str, int]] = {}
+        children_by_parent: dict[int, dict[tuple[str, str], int]] = {}
+        kind_by_id = {folder.id: folder.kind for folder in folders}
         for folder in folders:
             if folder.parent_id is None:
                 continue
             by_name = children_by_parent.setdefault(folder.parent_id, {})
-            by_name[folder.name.strip().lower()] = folder.id
+            by_name[(folder.name.strip().lower(), folder.kind)] = folder.id
 
         created_folder_count = 0
 
-        def ensure_child_folder(parent_id: int, requested_name: str) -> int:
+        def ensure_child_folder(
+            parent_id: int, requested_name: str, is_tray: bool = False,
+            reserved_names: set[str] | None = None,
+        ) -> int:
             nonlocal created_folder_count
 
             cleaned = requested_name.strip()
@@ -2405,14 +2466,30 @@ class MainWindow(QMainWindow):
                 cleaned = "Imported"
 
             by_name = children_by_parent.setdefault(parent_id, {})
-            existing_id = by_name.get(cleaned.lower())
+            name_key = cleaned.lower()
+            kind = "tray" if is_tray else "normal"
+            existing_id = by_name.get((name_key, kind))
             if existing_id is not None:
                 return existing_id
+            existing_id = by_name.get((name_key, "tray")) if not is_tray else None
+            if existing_id is not None:
+                items_id = self.library_store.convert_tray_to_folder(existing_id, reserved_names)
+                kind_by_id[existing_id] = "normal"
+                kind_by_id[items_id] = "tray"
+                items_name = self.library_store.get_folder(items_id).name
+                children_by_parent[existing_id] = {(items_name.lower(), "tray"): items_id}
+                del by_name[(name_key, "tray")]
+                by_name[(name_key, "normal")] = existing_id
+                created_folder_count += 1
+                return existing_id
 
-            created_id = self.library_store.create_folder(cleaned, parent_id)
+            if is_tray:
+                created_id = self.library_store.create_tray(cleaned, parent_id)
+            else:
+                created_id = self.library_store.create_folder(cleaned, parent_id)
             created_record = self.library_store.get_folder(created_id)
-            by_name[created_record.name.strip().lower()] = created_id
-            by_name[cleaned.lower()] = created_id
+            kind_by_id[created_id] = created_record.kind
+            by_name[(created_record.name.strip().lower(), created_record.kind)] = created_id
             created_folder_count += 1
             return created_id
 
@@ -2424,10 +2501,10 @@ class MainWindow(QMainWindow):
 
         def update_progress(current_file: Path) -> None:
             nonlocal processed_files, canceled
+            processed_files += 1
             if progress_dialog is None:
                 return
 
-            processed_files += 1
             progress_dialog.setLabelText(
                 f"Importing {processed_files}: {current_file.name}"
             )
@@ -2436,29 +2513,57 @@ class MainWindow(QMainWindow):
             if progress_dialog.wasCanceled():
                 canceled = True
 
-        root_id = self.library_store.get_root_folder_id()
-        imported_root_folder_id = ensure_child_folder(root_id, source_root.name)
+        selected_tray = self.library_store.get_folder(self._selected_folder_id())
+        if selected_tray.kind != "tray" or selected_tray.parent_id is None:
+            raise ValueError("Select a tray before importing a folder tree")
+
+        def directory_contents(fs_dir: Path) -> tuple[list[Path], list[Path]]:
+            children = sorted(fs_dir.iterdir(), key=lambda path: path.name.lower())
+            return (
+                [child for child in children if child.is_dir()],
+                [child for child in children if child.is_file() and child.suffix.lower() == ".gpx"],
+            )
+
+        root_dirs, root_files = directory_contents(source_root)
+        imported_root_folder_id = ensure_child_folder(
+            selected_tray.parent_id, source_root.name, is_tray=bool(root_files) and not root_dirs,
+            reserved_names={child.name for child in root_dirs},
+        )
 
         def visit(fs_dir: Path, target_folder_id: int) -> None:
             nonlocal imported_count, duplicate_count
             if canceled:
                 return
 
-            for child in sorted(fs_dir.iterdir(), key=lambda p: p.name.lower()):
+            directories, files = directory_contents(fs_dir)
+            if files and kind_by_id[target_folder_id] != "tray":
+                reserved_names = {child.name.strip().lower() for child in directories}
+                name = "Items"
+                number = 1
+                while name.lower() in reserved_names:
+                    name = f"Items ({number})"
+                    number += 1
+                item_tray_id = ensure_child_folder(target_folder_id, name, is_tray=True)
+            else:
+                item_tray_id = target_folder_id
+
+            for child in directories:
                 if canceled:
                     return
-                if child.is_dir():
-                    child_target_folder_id = ensure_child_folder(target_folder_id, child.name)
-                    visit(child, child_target_folder_id)
-                    continue
+                child_dirs, child_files = directory_contents(child)
+                child_target_folder_id = ensure_child_folder(
+                    target_folder_id, child.name, is_tray=bool(child_files) and not child_dirs,
+                    reserved_names={grandchild.name for grandchild in child_dirs},
+                )
+                visit(child, child_target_folder_id)
 
-                if not child.is_file() or child.suffix.lower() != ".gpx":
-                    continue
-
+            for child in files:
+                if canceled:
+                    return
                 try:
                     results = self.library_store.import_gpx_all(
                         child,
-                        target_folder_id=target_folder_id,
+                        target_folder_id=item_tray_id,
                     )
                     imported_count += len(results)
                     duplicate_count += sum(1 for result in results if result.is_duplicate)
@@ -2479,6 +2584,8 @@ class MainWindow(QMainWindow):
         )
 
     def _import_dropped_paths(self, path_values: list[str], folder_id: int) -> None:
+        if self.library_store.get_folder(folder_id).kind != "tray":
+            return
         file_paths = [Path(value) for value in path_values]
         imported_count, duplicate_count, failures = self._import_file_paths(file_paths, folder_id)
         self._reload_track_list()
@@ -2625,6 +2732,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         new_folder_action = menu.addAction("New Folder")
         new_folder_action.triggered.connect(self._create_folder_dialog)
+        new_tray_action = menu.addAction("New Tray")
+        new_tray_action.triggered.connect(self._create_tray_dialog)
 
         rename_folder_action = menu.addAction("Rename\tF2")
         rename_folder_action.triggered.connect(self._rename_selected_folder_dialog)
@@ -2635,6 +2744,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         import_action = menu.addAction("Import GPX Here")
         import_action.triggered.connect(self._import_gpx_into_selected_folder)
+        import_tree_action = menu.addAction("Import Folder Tree as Sibling...")
+        import_tree_action.triggered.connect(self._import_folder_tree_into_library)
 
         menu.addSeparator()
         cut_action = menu.addAction("Cut\tCtrl+X")
@@ -2643,9 +2754,13 @@ class MainWindow(QMainWindow):
         copy_action.triggered.connect(self._copy_selected_item)
         paste_action = menu.addAction("Paste\tCtrl+V")
         paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
-        paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
 
         kind = self._selected_folder_kind()
+        new_folder_action.setEnabled(kind in {"normal", "root"})
+        new_tray_action.setEnabled(kind in {"normal", "root"})
+        import_action.setEnabled(kind == "tray")
+        import_tree_action.setEnabled(kind == "tray")
+        paste_action.setEnabled(self._can_paste_into_kind(kind))
         if kind in {"root", "trash", None}:
             rename_folder_action.setEnabled(False)
             delete_folder_action.setEnabled(False)
@@ -2697,7 +2812,7 @@ class MainWindow(QMainWindow):
             show_action.setEnabled(has_selection)
             copy_action.setEnabled(has_selection)
             cut_action.setEnabled(has_selection and self._selected_folder_kind() != "trash")
-            paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
+            paste_action.setEnabled(self._can_paste_into_kind(self._selected_folder_kind()))
             rename_action.setEnabled(len(selected_ids) == 1)
             delete_action.setEnabled(has_selection)
 
@@ -2712,7 +2827,7 @@ class MainWindow(QMainWindow):
 
         paste_action = menu.addAction("Paste\tCtrl+V")
         paste_action.triggered.connect(self._paste_clipboard_into_selected_folder)
-        paste_action.setEnabled(self._clipboard_payload is not None and not self._clipboard_consumed)
+        paste_action.setEnabled(self._can_paste_into_kind(self._selected_folder_kind()))
 
         menu.addSeparator()
 
@@ -2833,6 +2948,9 @@ class MainWindow(QMainWindow):
             return
 
         payload = self._clipboard_payload
+        if not self._can_paste_into_kind(target_kind):
+            self.statusBar().showMessage("Choose a compatible folder or tray for paste", 4000)
+            return
         try:
             if payload.kind == "items":
                 if payload.operation == "copy":
@@ -2840,7 +2958,9 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(f"Pasted {len(copied)} copied item(s)", 5000)
                 else:
                     moved_count = 0
+                    source_folder_ids: set[int] = set()
                     for track_id in payload.item_ids:
+                        source_folder_ids.add(self.library_store.get_track(track_id).folder_id)
                         self.library_store.move_track_to_folder(track_id, target_folder_id)
                         moved_count += 1
                     self._clipboard_consumed = True
@@ -2849,6 +2969,9 @@ class MainWindow(QMainWindow):
                 self._load_library_tree(selected_folder_id=target_folder_id)
                 self._reload_track_list()
                 self._mark_preview_cache_dirty_for_ancestor_chain(target_folder_id)
+                if payload.operation == "cut":
+                    for source_folder_id in source_folder_ids:
+                        self._mark_preview_cache_dirty_for_ancestor_chain(source_folder_id)
                 return
 
             if payload.kind == "folder" and payload.folder_id is not None:
@@ -2870,6 +2993,13 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage("Folder moved", 5000)
         except Exception as exc:
             QMessageBox.warning(self, "Paste failed", str(exc))
+
+    def _can_paste_into_kind(self, kind: str | None) -> bool:
+        if self._clipboard_payload is None or self._clipboard_consumed:
+            return False
+        if self._clipboard_payload.kind == "items":
+            return kind == "tray"
+        return kind in {"root", "normal"}
 
     def _open_track_preview(self, item: QListWidgetItem) -> None:
         track_id = item.data(TRACK_ID_ROLE)
@@ -4072,18 +4202,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Merge tracks failed", str(exc))
 
     def _create_folder_dialog(self) -> None:
+        self._create_tree_node_dialog(is_tray=False)
+
+    def _create_tray_dialog(self) -> None:
+        self._create_tree_node_dialog(is_tray=True)
+
+    def _create_tree_node_dialog(self, is_tray: bool) -> None:
+        if self._selected_folder_kind() not in {"root", "normal"}:
+            return
         parent_id = self._selected_folder_id()
-        text, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+        label = "Tray" if is_tray else "Folder"
+        text, ok = QInputDialog.getText(self, f"New {label}", f"{label} name:")
         if not ok:
             return
 
         try:
-            self.library_store.create_folder(text, parent_id=parent_id)
+            if is_tray:
+                self.library_store.create_tray(text, parent_id=parent_id)
+            else:
+                self.library_store.create_folder(text, parent_id=parent_id)
             self._load_library_tree(selected_folder_id=parent_id)
             self._mark_preview_cache_dirty_for_ancestor_chain(parent_id)
-            self.statusBar().showMessage("Folder created", 4000)
+            self.statusBar().showMessage(f"{label} created", 4000)
         except Exception as exc:
-            QMessageBox.warning(self, "Create folder failed", str(exc))
+            QMessageBox.warning(self, f"Create {label.lower()} failed", str(exc))
 
     def _rename_selected_folder_dialog(self) -> None:
         folder_id = self._selected_folder_id()
@@ -4092,10 +4234,11 @@ class MainWindow(QMainWindow):
             return
 
         folder = self.library_store.get_folder(folder_id)
+        label = "Tray" if folder_kind == "tray" else "Folder"
         text, ok = QInputDialog.getText(
             self,
-            "Rename Folder",
-            "Folder name:",
+            f"Rename {label}",
+            f"{label} name:",
             text=folder.name,
         )
         if not ok:
@@ -4105,15 +4248,17 @@ class MainWindow(QMainWindow):
             self.library_store.rename_folder(folder_id, text)
             self._load_library_tree(selected_folder_id=folder_id)
             self._mark_all_preview_cache_dirty()
-            self.statusBar().showMessage("Folder renamed", 4000)
+            self.statusBar().showMessage(f"{label} renamed", 4000)
         except Exception as exc:
-            QMessageBox.warning(self, "Rename folder failed", str(exc))
+            QMessageBox.warning(self, f"Rename {label.lower()} failed", str(exc))
 
     def _delete_selected_folder(self) -> None:
         folder_id = self._selected_folder_id()
         folder_kind = self._selected_folder_kind()
         if folder_kind in {"root", "trash", None}:
             return
+
+        label = "tray" if folder_kind == "tray" else "folder"
 
         try:
             folder_record = self.library_store.get_folder(folder_id)
@@ -4122,8 +4267,8 @@ class MainWindow(QMainWindow):
 
         reply = QMessageBox.question(
             self,
-            "Delete folder",
-            "Delete this folder subtree? Items inside will be moved to Trash.",
+            f"Delete {label}",
+            f"Delete this {label}? Items inside will be moved to Trash.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -4141,9 +4286,9 @@ class MainWindow(QMainWindow):
             self._suppress_folder_overview_once = True
             self._load_library_tree(selected_folder_id=fallback_folder_id)
             self._mark_all_preview_cache_dirty()
-            self.statusBar().showMessage("Folder deleted; items moved to Trash", 5000)
+            self.statusBar().showMessage(f"{label.capitalize()} deleted; items moved to Trash", 5000)
         except Exception as exc:
-            QMessageBox.warning(self, "Delete folder failed", str(exc))
+            QMessageBox.warning(self, f"Delete {label} failed", str(exc))
 
     def _selected_track_ids(self) -> list[int]:
         if self.track_list is None:
@@ -4353,14 +4498,14 @@ class MainWindow(QMainWindow):
 
     def dragEnterEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         mime = event.mimeData()
-        if mime.hasUrls() and any(url.isLocalFile() for url in mime.urls()):
+        if self._selected_folder_kind() == "tray" and mime.hasUrls() and any(url.isLocalFile() for url in mime.urls()):
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         mime = event.mimeData()
-        if mime.hasUrls() and any(url.isLocalFile() for url in mime.urls()):
+        if self._selected_folder_kind() == "tray" and mime.hasUrls() and any(url.isLocalFile() for url in mime.urls()):
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
@@ -4369,6 +4514,10 @@ class MainWindow(QMainWindow):
         mime = event.mimeData()
         if not mime.hasUrls():
             super().dropEvent(event)
+            return
+
+        if self._selected_folder_kind() != "tray":
+            event.ignore()
             return
 
         paths: list[Path] = []
