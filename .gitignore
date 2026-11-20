@@ -1589,3 +1589,11 @@ gpx_organizer/__pycache__/settings_store.cpython-311.pyc
 tests/__pycache__/test_library_store.cpython-311-pytest-9.1.1.pyc
 tests/__pycache__/test_map_service.cpython-311-pytest-9.1.1.pyc
 tests/__pycache__/test_smoke.cpython-311-pytest-9.1.1.pyc
+gpx_organizer/__pycache__/library_store.cpython-311.pyc
+gpx_organizer/__pycache__/main_window.cpython-311.pyc
+gpx_organizer/__pycache__/map_service.cpython-311.pyc
+gpx_organizer/__pycache__/qt_compat.cpython-311.pyc
+gpx_organizer/__pycache__/library_store.cpython-311.pyc
+gpx_organizer/__pycache__/main_window.cpython-311.pyc
+gpx_organizer/__pycache__/map_service.cpython-311.pyc
+gpx_organizer/__pycache__/qt_compat.cpython-311.pyc

@@ -13,6 +13,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from gpx_analyzer import GPXAnalyzer, TrackPoint
+from .library_store import PreviewDataCache
 
 
 DEFAULT_RESPONSIVE_THRESHOLD_PX = 900
@@ -179,6 +180,7 @@ class LeafletMapService:
       ],
       progress: Callable[[int, int], None] | None = None,
       on_error: Callable[[str, str], None] | None = None,
+      cache: PreviewDataCache | None = None,
     ) -> RenderedMap:
       """Render a lightweight overview of multiple tracks and waypoints."""
       track_count_estimate = max(1, len(tracks))
@@ -202,9 +204,22 @@ class LeafletMapService:
           hover_label = track_name
 
         try:
-          coordinates = _extract_gpx_line_coordinates(track_path)
+          data = cache.get(track_id, track_path) if cache is not None and track_id is not None else None
+          if data is None:
+            root = ET.parse(track_path).getroot()
+            coordinates = _extract_gpx_line_coordinates(track_path, root)
+            waypoint_points = _extract_gpx_waypoints(track_path, root) if len(coordinates) < 2 else []
+            track_color = _read_track_display_color(track_path, root) if len(coordinates) >= 2 else None
+            data = {
+              "coordinates": _downsample_coordinates(coordinates, max_points=PREVIEW_MAX_POINTS_PER_TRACK),
+              "waypoints": waypoint_points,
+              "color": track_color,
+            }
+            if cache is not None and track_id is not None:
+              cache.put(track_id, track_path, data)
+          coordinates = data["coordinates"]
           if len(coordinates) < 2:
-            waypoint_points = _extract_gpx_waypoints(track_path)
+            waypoint_points = data["waypoints"]
             if not waypoint_points and on_error is not None:
               on_error(track_name, "No track or waypoint coordinates")
             for waypoint in waypoint_points:
@@ -219,13 +234,13 @@ class LeafletMapService:
                 }
               )
             continue
+          track_color = data.get("color") or self.default_track_color
         except Exception as exc:
           if on_error is not None:
             on_error(track_name, str(exc) or type(exc).__name__)
           # Keep overview usable even if one managed GPX file is malformed.
           continue
 
-        track_color = _read_track_display_color(track_path) or self.default_track_color
         entries.append(
           {
             "name": track_name,
@@ -1950,8 +1965,9 @@ def _lighten_hex_color(color: str, factor: float = 0.3) -> str:
     return f"#{red:02X}{green:02X}{blue:02X}"
 
 
-def _read_track_display_color(track_path: Path) -> str | None:
-    root = ET.parse(track_path).getroot()
+def _read_track_display_color(track_path: Path, root: ET.Element | None = None) -> str | None:
+    if root is None:
+        root = ET.parse(track_path).getroot()
     track = root.find(f".//{{{GPX_NS}}}trk")
     if track is None:
         return None
@@ -1970,8 +1986,9 @@ def _read_track_display_color(track_path: Path) -> str | None:
     return value
 
 
-def _extract_gpx_line_coordinates(track_path: Path) -> list[dict[str, float]]:
-    root = ET.parse(track_path).getroot()
+def _extract_gpx_line_coordinates(track_path: Path, root: ET.Element | None = None) -> list[dict[str, float]]:
+    if root is None:
+        root = ET.parse(track_path).getroot()
     coordinates: list[dict[str, float]] = []
 
     if root.tag.startswith("{"):
@@ -2001,8 +2018,9 @@ def _extract_gpx_line_coordinates(track_path: Path) -> list[dict[str, float]]:
     return coordinates
 
 
-def _extract_gpx_waypoints(track_path: Path) -> list[dict[str, object]]:
-    root = ET.parse(track_path).getroot()
+def _extract_gpx_waypoints(track_path: Path, root: ET.Element | None = None) -> list[dict[str, object]]:
+    if root is None:
+        root = ET.parse(track_path).getroot()
     waypoints: list[dict[str, object]] = []
 
     if root.tag.startswith("{"):

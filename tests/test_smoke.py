@@ -72,7 +72,7 @@ def test_folder_preview_worker_and_large_document(tmp_path: Path, monkeypatch) -
     release = Event()
 
     class BlockingMapService(main_window.LeafletMapService):
-        def render_track_lines_preview(self, tracks, progress=None, on_error=None):
+        def render_track_lines_preview(self, tracks, progress=None, on_error=None, cache=None):
             started.set()
             release.wait(5)
             progress(1, 1)
@@ -91,6 +91,19 @@ def test_folder_preview_worker_and_large_document(tmp_path: Path, monkeypatch) -
     assert window._preview_worker_folder is None
     assert '"trackId": 499,' in window._preview_cache[folder_id].html
     monkeypatch.setattr(window, "_selected_folder_id", lambda: folder_id)
+
+    window.map_service = main_window.LeafletMapService()
+    imported = store.import_gpx(gpx, target_folder_id=folder_id)
+    window._start_folder_preview_worker(
+        folder_id, [(imported.track_id, imported.managed_path, "Track", "Folder/Track")], 1
+    )
+    deadline = monotonic() + 10
+    while window._preview_worker_folder is not None and monotonic() < deadline:
+        app.processEvents()
+        Event().wait(0.005)
+    assert window._preview_worker_folder is None
+    with store.preview_data_cache() as cache:
+        assert cache.get(imported.track_id, imported.managed_path) is not None
 
     class FakeView:
         def load(self, url):

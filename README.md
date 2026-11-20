@@ -8,3 +8,8 @@ Actually I am developing and running it on a Raspberry Pi 5 with bookworm instal
 The final Version should run on most Unix derivates as well as on Windows Computers.
 
 You are welcome to test it and any hints concerning bugs or improvements are appreciated.
+
+Folder previews cache simplified track and waypoint data in the library database.
+The first preview of an existing folder builds the cache in the background; later
+previews can reuse it, including after restarting the app. Original GPX files are
+not altered by preview caching.

@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import copy
 import hashlib
 from io import BytesIO
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import shutil
 import sqlite3
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 import xml.etree.ElementTree as ET
 
 from gpx_analyzer import GPXAnalyzer
@@ -67,6 +69,85 @@ class ImportResult:
     entry_kind: str = "track"
 
 
+PREVIEW_DATA_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
+
+
+class PreviewDataCache:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._sources: dict[int, tuple[int, int, str]] = {}
+        self._pending: list[tuple[int, int, int, int, str, str]] = []
+        self._disabled = False
+
+    def get(self, track_id: int, path: Path) -> dict[str, Any] | None:
+        stat = path.stat()
+        if self._disabled:
+            return None
+        try:
+            row = self._conn.execute(
+                """SELECT t.file_hash, c.source_hash, c.version, c.file_mtime_ns, c.file_size, c.payload_json
+                   FROM tracks t LEFT JOIN preview_data_cache c ON c.track_id = t.id
+                   WHERE t.id = ?""",
+                (track_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            self._disabled = True
+            _LOGGER.warning("Preview cache unavailable: %s", exc)
+            return None
+        if row is None:
+            return None
+        self._sources[track_id] = (stat.st_mtime_ns, stat.st_size, str(row["file_hash"]))
+        if (
+            row["version"] != PREVIEW_DATA_VERSION
+            or row["source_hash"] != row["file_hash"]
+            or row["file_mtime_ns"] != stat.st_mtime_ns
+            or row["file_size"] != stat.st_size
+        ):
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("coordinates"), list)
+                or not isinstance(payload.get("waypoints"), list)
+            ):
+                return None
+            return payload
+        except (ValueError, TypeError):
+            return None
+
+    def put(self, track_id: int, path: Path, payload: dict[str, Any]) -> None:
+        source = self._sources.get(track_id)
+        if source is None or self._disabled:
+            return
+        stat = path.stat()
+        mtime_ns, size, file_hash = source
+        if (stat.st_mtime_ns, stat.st_size) != (mtime_ns, size):
+            return
+        self._pending.append((track_id, PREVIEW_DATA_VERSION, mtime_ns, size, json.dumps(payload), file_hash))
+        if len(self._pending) >= 32:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._pending:
+            return
+        try:
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO preview_data_cache
+                   (track_id, version, file_mtime_ns, file_size, payload_json, source_hash)
+                   SELECT id, ?, ?, ?, ?, file_hash FROM tracks WHERE id = ? AND file_hash = ?""",
+                [(version, mtime, size, payload, track_id, file_hash)
+                 for track_id, version, mtime, size, payload, file_hash in self._pending],
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            self._conn.rollback()
+            self._disabled = True
+            _LOGGER.warning("Preview cache could not be saved: %s", exc)
+        self._pending.clear()
+
+
 class LibraryStore:
     """Handle persistent storage, import, and managed-file lifecycle."""
 
@@ -117,6 +198,15 @@ class LibraryStore:
 
                 CREATE INDEX IF NOT EXISTS idx_tracks_folder_id ON tracks(folder_id);
                 CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
+
+                CREATE TABLE IF NOT EXISTS preview_data_cache (
+                    track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    file_mtime_ns INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    source_hash TEXT NOT NULL
+                );
                 """
             )
 
@@ -183,6 +273,18 @@ class LibraryStore:
             )
             for row in rows
         ]
+
+    @contextmanager
+    def preview_data_cache(self) -> Iterator[PreviewDataCache]:
+        conn = self._connect()
+        cache = PreviewDataCache(conn)
+        try:
+            yield cache
+        finally:
+            try:
+                cache.flush()
+            finally:
+                conn.close()
 
     def list_tracks(self, folder_id: int) -> list[TrackRecord]:
         """Return tracks assigned to a given folder."""
@@ -757,6 +859,7 @@ class LibraryStore:
             if managed_path.exists():
                 managed_path.unlink()
 
+            conn.execute("DELETE FROM preview_data_cache WHERE track_id = ?", (track_id,))
             conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
 
     def export_track(self, track_id: int, destination_path: Path, overwrite: bool = False) -> Path:

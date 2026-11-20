@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
 from gpx_organizer.map_service import LeafletMapService, TRACK_RENDER_MAX_POINTS
+from gpx_organizer import map_service
+from gpx_organizer.library_store import LibraryStore
 
 
 SAMPLE_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -192,6 +195,112 @@ def test_folder_preview_progress_counts_skipped_files(tmp_path: Path) -> None:
     assert updates == [(0, 2), (1, 2), (2, 2)]
     assert failures == ["Missing"]
     assert '"trackId": 1' in rendered.html
+
+
+def test_folder_preview_parses_each_item_once(tmp_path: Path, monkeypatch) -> None:
+    track = tmp_path / "track.gpx"
+    track.write_text(SAMPLE_GPX, encoding="utf-8")
+    parse = map_service.ET.parse
+    parsed: list[Path] = []
+
+    def counting_parse(path):
+        parsed.append(path)
+        return parse(path)
+
+    monkeypatch.setattr(map_service.ET, "parse", counting_parse)
+    LeafletMapService().render_track_lines_preview([(1, track, "Track")])
+    assert parsed == [track]
+
+
+def test_folder_preview_cache_survives_restart_and_invalidates_edits(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.gpx"
+    source.write_text(SAMPLE_GPX, encoding="utf-8")
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    imported = store.import_gpx(source)
+    service = LeafletMapService()
+    parse = map_service.ET.parse
+    parsed: list[Path] = []
+
+    def counting_parse(path):
+        parsed.append(path)
+        return parse(path)
+
+    monkeypatch.setattr(map_service.ET, "parse", counting_parse)
+
+    def render(current_store):
+        track = current_store.get_track(imported.track_id)
+        path = current_store.library_root / track.managed_rel_path
+        with current_store.preview_data_cache() as cache:
+            return service.render_track_lines_preview([(track.id, path, track.display_name)], cache=cache)
+
+    first = render(store)
+    assert len(parsed) == 1
+    reopened = LibraryStore(store.library_root)
+    reopened.initialize()
+    assert render(reopened).html == first.html
+    assert len(parsed) == 1
+
+    store.rename_track(imported.track_id, "Renamed")
+    assert 'Renamed' in render(reopened).html
+    assert len(parsed) == 1
+
+    store.reverse_track(imported.track_id)
+    parsed.clear()
+    reversed_preview = render(reopened)
+    assert len(parsed) == 1
+    assert reversed_preview.html.index('48.101') < reversed_preview.html.index('48.1,')
+
+    store.set_track_color(imported.track_id, "#123456")
+    parsed.clear()
+    assert '#123456' in render(reopened).html
+    assert len(parsed) == 1
+
+    managed_path = store.get_track_managed_path(imported.track_id)
+    managed_path.write_text(SAMPLE_GPX.replace('48.100000', '47.200000'), encoding="utf-8")
+    parsed.clear()
+    assert '47.2' in render(reopened).html
+    assert len(parsed) == 1
+    managed_path.unlink()
+    failures: list[str] = []
+    with reopened.preview_data_cache() as cache:
+        service.render_track_lines_preview(
+            [(imported.track_id, managed_path, "Missing")], cache=cache,
+            on_error=lambda name, reason: failures.append(name),
+        )
+    assert failures == ["Missing"]
+
+
+def test_folder_preview_cache_stores_waypoints(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "waypoint.gpx"
+    source.write_text(WAYPOINT_GPX, encoding="utf-8")
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    imported = store.import_gpx_all(source)[0]
+    service = LeafletMapService()
+    inputs = [(imported.track_id, imported.managed_path, "Home Pin")]
+    with store.preview_data_cache() as cache:
+        first = service.render_track_lines_preview(inputs, cache=cache)
+    monkeypatch.setattr(map_service.ET, "parse", lambda *args: pytest.fail("unexpected GPX parse"))
+    with store.preview_data_cache() as cache:
+        second = service.render_track_lines_preview(inputs, cache=cache)
+    assert second.html == first.html
+
+
+def test_folder_preview_renders_when_cache_is_unavailable(tmp_path: Path) -> None:
+    source = tmp_path / "track.gpx"
+    source.write_text(SAMPLE_GPX, encoding="utf-8")
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    track = store.import_gpx(source)
+    with store._connect() as conn:
+        conn.execute("DROP TABLE preview_data_cache")
+
+    with store.preview_data_cache() as cache:
+        rendered = LeafletMapService().render_track_lines_preview(
+            [(track.track_id, track.managed_path, "Track")], cache=cache
+        )
+    assert f'"trackId": {track.track_id},' in rendered.html
 
 
 def test_large_folder_preview_keeps_all_items(tmp_path: Path) -> None:

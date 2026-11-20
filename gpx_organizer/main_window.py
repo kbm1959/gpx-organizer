@@ -2024,6 +2024,7 @@ class MainWindow(QMainWindow):
 
     def _start_folder_preview_worker(self, folder_id: int, track_inputs: list, count: int) -> None:
         service = copy.copy(self.map_service)
+        store = self.library_store
         revision = self._preview_revision
         cancel = Event()
         self._preview_cancel = cancel
@@ -2048,11 +2049,13 @@ class MainWindow(QMainWindow):
             failures: list[str] = []
             try:
                 if isinstance(service, LeafletMapService):
-                    rendered = service.render_track_lines_preview(
-                        track_inputs,
-                        progress=progress,
-                        on_error=lambda name, reason: failures.append(f"{name}: {reason}"),
-                    )
+                    with store.preview_data_cache() as cache:
+                        rendered = service.render_track_lines_preview(
+                            track_inputs,
+                            progress=progress,
+                            on_error=lambda name, reason: failures.append(f"{name}: {reason}"),
+                            cache=cache,
+                        )
                 else:
                     rendered = service.render_track_lines_preview(track_inputs)
                 if cancel.is_set():

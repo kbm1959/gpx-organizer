@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
+
+import pytest
 
 from gpx_analyzer import GPXAnalyzer
 from gpx_organizer.library_store import LibraryStore
@@ -49,6 +52,43 @@ def test_initialize_creates_root_and_trash(tmp_path: Path) -> None:
 
     assert "My Library" in names
     assert "Trash" in names
+
+
+def test_preview_cache_flushes_after_interrupted_build(tmp_path: Path) -> None:
+    source = tmp_path / "ride.gpx"
+    _write_sample(source)
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    track = store.import_gpx(source)
+    payload = {"coordinates": [], "waypoints": [], "color": None}
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with store.preview_data_cache() as cache:
+            assert cache.get(track.track_id, track.managed_path) is None
+            cache.put(track.track_id, track.managed_path, payload)
+            raise RuntimeError("interrupted")
+    with store.preview_data_cache() as cache:
+        assert cache.get(track.track_id, track.managed_path) == payload
+
+
+def test_preview_cache_rejects_stale_write_after_edit_or_purge(tmp_path: Path) -> None:
+    source = tmp_path / "ride.gpx"
+    _write_sample(source)
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    track = store.import_gpx(source)
+    payload = {"coordinates": [], "waypoints": [], "color": None}
+
+    with store.preview_data_cache() as cache:
+        assert cache.get(track.track_id, track.managed_path) is None
+        cache.put(track.track_id, track.managed_path, payload)
+        store.reverse_track(track.track_id)
+    with store.preview_data_cache() as cache:
+        assert cache.get(track.track_id, track.managed_path) is None
+        cache.put(track.track_id, track.managed_path, payload)
+        store.move_track_to_trash(track.track_id)
+        store.purge_track(track.track_id)
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM preview_data_cache").fetchone()[0] == 0
 
 
 def test_import_hash_duplicate_gets_numbered_filename(tmp_path: Path) -> None:
