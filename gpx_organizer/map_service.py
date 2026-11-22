@@ -12,8 +12,17 @@ from typing import Callable, Protocol
 import re
 import xml.etree.ElementTree as ET
 
-from gpx_analyzer import GPXAnalyzer, TrackPoint
+from gpx_analyzer import (
+  DEFAULT_REST_MIN_DURATION_S,
+  DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+  DEFAULT_REST_RADIUS_M,
+  GPXAnalyzer,
+  TrackPoint,
+  TRACK_RENDER_MAX_POINTS,
+  downsample_track_points as _downsample_track_points,
+)
 from .library_store import PreviewDataCache
+from .time_utils import DEFAULT_TIME_ZONE, format_track_time, normalize_time_zone
 
 
 DEFAULT_RESPONSIVE_THRESHOLD_PX = 900
@@ -40,7 +49,6 @@ DEFAULT_DIRECTION_ARROW_COUNT = 10
 DEFAULT_DIRECTION_ARROW_SIZE_PX = 12
 DEFAULT_TRACK_POINT_COLOR = "#000000"
 DEFAULT_TRACK_POINT_SIZE_PX = 1
-TRACK_RENDER_MAX_POINTS = 3500
 PREVIEW_TOTAL_POINT_BUDGET = 7000
 PREVIEW_MIN_POINTS_PER_TRACK = 8
 PREVIEW_MAX_POINTS_PER_TRACK = 320
@@ -96,6 +104,10 @@ class LeafletMapService:
         direction_arrow_size_px: int = DEFAULT_DIRECTION_ARROW_SIZE_PX,
         track_point_color: str = DEFAULT_TRACK_POINT_COLOR,
         track_point_size_px: int = DEFAULT_TRACK_POINT_SIZE_PX,
+        time_zone: str = DEFAULT_TIME_ZONE,
+        rest_stop_radius_m: float = DEFAULT_REST_RADIUS_M,
+        rest_stop_min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+        rest_stop_endpoint_distance_multiplier: float = DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
     ) -> None:
         self.responsive_threshold_px = max(320, int(responsive_threshold_px))
         self.bicycle_route_tile_url = bicycle_route_tile_url
@@ -131,6 +143,12 @@ class LeafletMapService:
         self.direction_arrow_size_px = max(8, min(40, int(direction_arrow_size_px)))
         self.track_point_color = _normalize_hex_color(track_point_color, DEFAULT_TRACK_POINT_COLOR)
         self.track_point_size_px = max(1, min(10, int(track_point_size_px)))
+        self.time_zone = normalize_time_zone(time_zone)
+        self.rest_stop_radius_m = max(0.1, float(rest_stop_radius_m))
+        self.rest_stop_min_duration_s = max(1.0, float(rest_stop_min_duration_s))
+        self.rest_stop_endpoint_distance_multiplier = max(
+          1.0, float(rest_stop_endpoint_distance_multiplier)
+        )
         self.track_delete_uses_permanent = False
 
     def render_track(
@@ -385,7 +403,8 @@ class LeafletMapService:
     def _build_track_payload(self, track_path: Path, track_name: str) -> dict[str, object] | None:
       analyzer = GPXAnalyzer()
       analyzer.read_gpx_file(track_path)
-      points = analyzer.get_track_points()
+      segments = analyzer.get_track_point_segments()
+      points = [point for segment in segments for point in segment]
 
       if not points:
         return None
@@ -393,10 +412,11 @@ class LeafletMapService:
       render_points = _downsample_track_points(points, max_points=TRACK_RENDER_MAX_POINTS)
 
       stats = analyzer.calculate_ride_stats(track_points=points)
-      rest_stops = analyzer.find_rest_stops(
-        track_points=points,
-        radius_m=5.0,
-        min_duration_s=120.0,
+      rest_stops = analyzer.find_track_rest_stops(
+        track_segments=segments,
+        radius_m=self.rest_stop_radius_m,
+        min_duration_s=self.rest_stop_min_duration_s,
+        endpoint_distance_multiplier=self.rest_stop_endpoint_distance_multiplier,
       )
 
       coordinates = [
@@ -424,6 +444,8 @@ class LeafletMapService:
           "start": start,
           "end": end,
           "trackName": track_name,
+        "startTimeDisplay": format_track_time(start["time"], self.time_zone) or "n/a",
+        "endTimeDisplay": format_track_time(end["time"], self.time_zone) or "n/a",
         "totalDistanceKm": total_distance_km,
         "trackColor": track_color,
         "restStopColor": self.rest_stop_color,
@@ -446,14 +468,17 @@ class LeafletMapService:
         "directionArrows": direction_arrows,
         "restStops": [
           {
+            "restNumber": rest_number,
             "lat": stop.latitude,
             "lon": stop.longitude,
             "startTime": stop.start_time.isoformat(),
             "endTime": stop.end_time.isoformat(),
+            "startTimeDisplay": format_track_time(stop.start_time.isoformat(), self.time_zone) or "n/a",
+            "endTimeDisplay": format_track_time(stop.end_time.isoformat(), self.time_zone) or "n/a",
             "durationMin": round(stop.duration_s / 60.0, 1),
             "elevation": stop.elevation_m,
           }
-          for stop in rest_stops
+          for rest_number, stop in enumerate(rest_stops, start=1)
         ],
       }
 
@@ -1003,8 +1028,8 @@ class LeafletMapService:
       window.__gpxFitTrack();
       updateDirectionArrowsForViewport();
 
-      const startTime = payload.start.time ? new Date(payload.start.time).toLocaleString() : "n/a";
-      const endTime = payload.end.time ? new Date(payload.end.time).toLocaleString() : "n/a";
+      const startTime = payload.startTimeDisplay;
+      const endTime = payload.endTimeDisplay;
 
       addEndpointSymbol(
         payload.start.lat,
@@ -1045,19 +1070,22 @@ class LeafletMapService:
       payload.restStops.forEach((stop) => {{
         const elevation = stop.elevation === null ? "n/a" : `${{Math.round(stop.elevation)}} m`;
         const popup =
-          `<strong>Rest Stop</strong><br>` +
-          `Start: ${{new Date(stop.startTime).toLocaleString()}}<br>` +
-          `End: ${{new Date(stop.endTime).toLocaleString()}}<br>` +
+          `<strong>Rest Stop ${{stop.restNumber}}</strong><br>` +
+          `Start: ${{stop.startTimeDisplay}}<br>` +
+          `End: ${{stop.endTimeDisplay}}<br>` +
           `Duration: ${{stop.durationMin}} min<br>` +
           `Elevation: ${{elevation}}`;
 
-        L.circleMarker([stop.lat, stop.lon], {{
-          radius: payload.restStopSizePx,
-          color: payload.restStopColor,
-          fillColor: payload.restStopColor,
-          fillOpacity: 0.85,
-          weight: 2,
-        }})
+        const restIcon = L.divIcon({{
+          className: "",
+          html: `<span style="display:flex;align-items:center;justify-content:center;` +
+            `width:24px;height:24px;border-radius:50%;background:${{payload.restStopColor}};` +
+            `border:2px solid #fff;box-shadow:0 1px 4px #333;color:#fff;font-weight:700;` +
+            `font-size:12px">${{stop.restNumber}}</span>`,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        }});
+        L.marker([stop.lat, stop.lon], {{ icon: restIcon }})
           .addTo(layers.rests)
           .bindPopup(popup);
       }});
@@ -1686,7 +1714,7 @@ class LeafletMapService:
           track.startSymbolColor,
           track.startSymbolSizePx,
           track.startSymbolShape,
-          `<strong>${{track.trackName}} - Start</strong>`
+          `<strong>${{track.trackName}} - Start</strong><br>Time: ${{track.startTimeDisplay}}`
         );
         addEndpointSymbol(
           track.end.lat,
@@ -1694,7 +1722,7 @@ class LeafletMapService:
           track.stopSymbolColor,
           track.stopSymbolSizePx,
           track.stopSymbolShape,
-          `<strong>${{track.trackName}} - End</strong>`
+          `<strong>${{track.trackName}} - End</strong><br>Time: ${{track.endTimeDisplay}}`
         );
 
         track.distanceMarkers.forEach((marker) => {{
@@ -1708,13 +1736,22 @@ class LeafletMapService:
         }});
 
         track.restStops.forEach((stop) => {{
-          L.circleMarker([stop.lat, stop.lon], {{
-            radius: track.restStopSizePx,
-            color: track.restStopColor,
-            fillColor: track.restStopColor,
-            fillOpacity: 0.85,
-            weight: 2,
-          }}).addTo(layers.rests);
+          const restIcon = L.divIcon({{
+            className: "",
+            html: `<span style="display:flex;align-items:center;justify-content:center;` +
+              `width:24px;height:24px;border-radius:50%;background:${{track.restStopColor}};` +
+              `border:2px solid #fff;box-shadow:0 1px 4px #333;color:#fff;font-weight:700;` +
+              `font-size:12px">${{stop.restNumber}}</span>`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14],
+          }});
+          const popup =
+            `<strong>${{track.trackName}} - Rest Stop ${{stop.restNumber}}</strong><br>` +
+            `Start: ${{stop.startTimeDisplay}}<br>End: ${{stop.endTimeDisplay}}<br>` +
+            `Duration: ${{stop.durationMin}} min`;
+          L.marker([stop.lat, stop.lon], {{ icon: restIcon }})
+            .addTo(layers.rests)
+            .bindPopup(popup);
         }});
 
       }});
@@ -2093,25 +2130,5 @@ def _downsample_coordinates(
         src_index = int(round(index * step))
         src_index = max(0, min(len(coordinates) - 1, src_index))
         sampled.append(coordinates[src_index])
-
-    return sampled
-
-
-def _downsample_track_points(
-    points: list[TrackPoint],
-    max_points: int,
-) -> list[TrackPoint]:
-    if len(points) <= max_points:
-        return points
-
-    if max_points < 2:
-        return [points[0], points[-1]]
-
-    step = (len(points) - 1) / float(max_points - 1)
-    sampled: list[TrackPoint] = []
-    for index in range(max_points):
-        src_index = int(round(index * step))
-        src_index = max(0, min(len(points) - 1, src_index))
-        sampled.append(points[src_index])
 
     return sampled

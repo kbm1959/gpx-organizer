@@ -9,6 +9,7 @@ import pytest
 from gpx_organizer.map_service import LeafletMapService, TRACK_RENDER_MAX_POINTS
 from gpx_organizer import map_service
 from gpx_organizer.library_store import LibraryStore
+from gpx_organizer.track_analysis import analyze_track_segments
 
 
 SAMPLE_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -52,6 +53,73 @@ def test_render_track_contains_leaflet_and_track_name(tmp_path: Path) -> None:
     assert rendered.title == "Sample Ride"
     assert "leaflet" in rendered.html.lower()
     assert "Sample Ride" in rendered.html
+
+
+def test_map_endpoints_use_configured_timezone(tmp_path: Path) -> None:
+    gpx_path = tmp_path / "sample.gpx"
+    gpx_path.write_text(SAMPLE_GPX, encoding="utf-8")
+    service = LeafletMapService(time_zone="Europe/Berlin")
+    payload = service._build_track_payload(gpx_path, "Sample")
+    assert payload is not None
+    assert payload["startTimeDisplay"] == "2026-08-08 10:00:00 CEST (UTC+02:00)"
+    assert payload["endTimeDisplay"] == "2026-08-08 10:02:00 CEST (UTC+02:00)"
+    assert 'const startTime = payload.startTimeDisplay;' in service.render_track(gpx_path, "Sample").html
+    service.time_zone = "UTC"
+    assert service._build_track_payload(gpx_path, "Sample")["startTimeDisplay"] == "2026-08-08 08:00:00 UTC (UTC+00:00)"
+
+
+def test_map_endpoints_use_dst_and_preserve_unknown_timezone(tmp_path: Path) -> None:
+    gpx_path = tmp_path / "sample.gpx"
+    spring = SAMPLE_GPX.replace("2026-08-08T08:00:00Z", "2026-03-29T00:59:59Z").replace(
+        "2026-08-08T08:02:00Z", "2026-03-29T01:00:00Z"
+    )
+    gpx_path.write_text(spring, encoding="utf-8")
+    service = LeafletMapService(time_zone="Europe/Berlin")
+    payload = service._build_track_payload(gpx_path, "Sample")
+    assert payload["startTimeDisplay"] == "2026-03-29 01:59:59 CET (UTC+01:00)"
+    assert payload["endTimeDisplay"] == "2026-03-29 03:00:00 CEST (UTC+02:00)"
+    html = service.render_tracks_with_overlays([(gpx_path, "First"), (gpx_path, "Second")]).html
+    assert 'Time: ${track.startTimeDisplay}' in html
+    assert '2026-03-29 03:00:00 CEST (UTC+02:00)' in html
+    gpx_path.write_text(spring.replace("2026-03-29T00:59:59Z", "2026-03-29T00:59:59"), encoding="utf-8")
+    assert service._build_track_payload(gpx_path, "Sample")["startTimeDisplay"] == "2026-03-29 00:59:59 (timezone unknown)"
+
+
+def test_map_and_properties_share_numbered_endpoint_excluding_rests(tmp_path: Path) -> None:
+    source = tmp_path / "rest-track.gpx"
+    points = (
+        (48.000, 0), (48.000, 61), (48.001, 70), (48.002, 80), (48.002, 140),
+        (48.003, 150), (48.004, 160), (48.004, 220), (48.005, 230), (48.005, 291),
+    )
+    track_points = "".join(
+        f'<trkpt lat="{latitude:.3f}" lon="7"><time>2026-01-01T10:{minute // 60:02d}:{minute % 60:02d}Z</time></trkpt>'
+        for latitude, minute in points
+    )
+    source.write_text(
+        '<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>'
+        + track_points + '</trkseg></trk></gpx>',
+        encoding="utf-8",
+    )
+    service = LeafletMapService(
+        rest_stop_radius_m=2,
+        rest_stop_min_duration_s=60,
+        rest_stop_endpoint_distance_multiplier=10,
+    )
+    analyzer = map_service.GPXAnalyzer()
+    analyzer.read_gpx_file(source)
+    properties = analyze_track_segments(
+        analyzer.get_track_point_segments(),
+        rest_radius_m=2,
+        rest_min_duration_s=60,
+        rest_endpoint_distance_multiplier=10,
+    )
+    payload = service._build_track_payload(source, "Rest track")
+    assert payload is not None
+    assert properties["rest_count"] == len(payload["restStops"]) == 2
+    assert [stop["restNumber"] for stop in payload["restStops"]] == [1, 2]
+    assert payload["restStops"][0]["startTime"].endswith("10:01:20+00:00")
+    assert 'Rest Stop ${stop.restNumber}' in service.render_track(source, "Rest track").html
+    assert 'html: `<span style="display:flex' in service.render_track(source, "Rest track").html
 
 
 def test_render_placeholder_escapes_html() -> None:

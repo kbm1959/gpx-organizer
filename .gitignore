@@ -1597,3 +1597,11 @@ gpx_organizer/__pycache__/library_store.cpython-311.pyc
 gpx_organizer/__pycache__/main_window.cpython-311.pyc
 gpx_organizer/__pycache__/map_service.cpython-311.pyc
 gpx_organizer/__pycache__/qt_compat.cpython-311.pyc
+gpx_organizer/__pycache__/app.cpython-311.pyc
+gpx_organizer/__pycache__/library_store.cpython-311.pyc
+gpx_organizer/__pycache__/main_window.cpython-311.pyc
+gpx_organizer/__pycache__/map_service.cpython-311.pyc
+gpx_organizer/__pycache__/qt_compat.cpython-311.pyc
+gpx_organizer/__pycache__/settings_store.cpython-311.pyc
+gpx_organizer/__pycache__/time_utils.cpython-311.pyc
+gpx_organizer/__pycache__/track_analysis.cpython-311.pyc

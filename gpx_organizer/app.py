@@ -13,6 +13,10 @@ from .main_window import MainWindow
 from .map_service import LeafletMapService
 from .qt_compat import QApplication, QT_BINDING
 from .settings_store import (
+    get_track_rest_endpoint_distance_multiplier,
+    get_track_rest_min_duration_s,
+    get_track_rest_radius_m,
+    get_time_zone,
     get_map_default_track_color,
     get_map_direction_arrow_count,
     get_map_direction_arrow_color,
@@ -60,6 +64,10 @@ def run() -> int:
 
     logger.info("Map responsive threshold: %spx", responsive_threshold_px)
     map_service = LeafletMapService(
+        time_zone=get_time_zone(),
+        rest_stop_radius_m=get_track_rest_radius_m(),
+        rest_stop_min_duration_s=get_track_rest_min_duration_s(),
+        rest_stop_endpoint_distance_multiplier=get_track_rest_endpoint_distance_multiplier(),
         responsive_threshold_px=responsive_threshold_px,
         rest_stop_color=get_map_rest_stop_color(),
         rest_stop_size_px=get_map_rest_stop_size_px(),

@@ -19,6 +19,21 @@ class TrackPoint:
     time: datetime | None
 
 
+TRACK_RENDER_MAX_POINTS = 3500
+DEFAULT_REST_RADIUS_M = 2.0
+DEFAULT_REST_MIN_DURATION_S = 60.0
+DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER = 10.0
+
+
+def downsample_track_points(points: list[TrackPoint], max_points: int) -> list[TrackPoint]:
+    if len(points) <= max_points:
+        return points
+    if max_points < 2:
+        return [points[0], points[-1]]
+    step = (len(points) - 1) / float(max_points - 1)
+    return [points[min(len(points) - 1, max(0, int(round(index * step))))] for index in range(max_points)]
+
+
 @dataclass(frozen=True)
 class RestStop:
     """A detected stop where movement stayed within a small radius."""
@@ -73,13 +88,27 @@ class GPXAnalyzer:
             raise RuntimeError("No GPX file loaded. Call read_gpx_file() first.")
 
         namespace = self._get_default_namespace()
+        return self._extract_track_points(self.root, namespace)
+
+    def get_track_point_segments(self) -> list[list[TrackPoint]]:
+        """Extract track points grouped by GPX segment."""
+        if self.root is None:
+            raise RuntimeError("No GPX file loaded. Call read_gpx_file() first.")
+        namespace = self._get_default_namespace()
+        return [
+            self._extract_track_points(segment, namespace)
+            for segment in self.root.findall(f".//{{{namespace}}}trkseg")
+        ]
+
+    @staticmethod
+    def _extract_track_points(root: ET.Element, namespace: str) -> list[TrackPoint]:
         trkpt_path = f".//{{{namespace}}}trkpt"
         ele_path = f"{{{namespace}}}ele"
         time_path = f"{{{namespace}}}time"
 
         points: list[TrackPoint] = []
 
-        for trkpt in self.root.findall(trkpt_path):
+        for trkpt in root.findall(trkpt_path):
             lat_raw = trkpt.get("lat")
             lon_raw = trkpt.get("lon")
 
@@ -139,7 +168,10 @@ class GPXAnalyzer:
             if current.time is None or nxt.time is None:
                 continue
 
-            delta_t = (nxt.time - current.time).total_seconds()
+            try:
+                delta_t = (nxt.time - current.time).total_seconds()
+            except (TypeError, OverflowError):
+                continue
             if delta_t <= 0:
                 continue
 
@@ -160,10 +192,24 @@ class GPXAnalyzer:
     def find_rest_stops(
         self,
         track_points: list[TrackPoint] | None = None,
-        radius_m: float = 2.0,
-        min_duration_s: float = 60.0,
+        radius_m: float = DEFAULT_REST_RADIUS_M,
+        min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
     ) -> list[RestStop]:
         """Find time spans where coordinates stay within a radius for long enough."""
+        return [
+            stop
+            for stop, _, _ in self.find_rest_stops_indexed(
+                track_points, radius_m=radius_m, min_duration_s=min_duration_s
+            )
+        ]
+
+    def find_rest_stops_indexed(
+        self,
+        track_points: list[TrackPoint] | None = None,
+        radius_m: float = DEFAULT_REST_RADIUS_M,
+        min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+    ) -> list[tuple[RestStop, int, int]]:
+        """Find rest spans and return their inclusive start/end point indices."""
         if radius_m <= 0:
             raise ValueError("radius_m must be > 0")
 
@@ -175,7 +221,7 @@ class GPXAnalyzer:
         if len(points) < 2:
             return []
 
-        rest_stops: list[RestStop] = []
+        rest_stops: list[tuple[RestStop, int, int]] = []
         i = 0
 
         while i < len(points) - 1:
@@ -201,7 +247,11 @@ class GPXAnalyzer:
             end_point = points[end_idx]
 
             if end_idx > i and end_point.time is not None:
-                duration_s = (end_point.time - anchor.time).total_seconds()
+                try:
+                    duration_s = (end_point.time - anchor.time).total_seconds()
+                except (TypeError, OverflowError):
+                    i = max(i + 1, end_idx + 1)
+                    continue
                 if duration_s >= min_duration_s:
                     cluster = points[i : end_idx + 1]
                     avg_lat = sum(point.latitude for point in cluster) / len(cluster)
@@ -215,19 +265,104 @@ class GPXAnalyzer:
                         avg_ele = sum(elevations) / len(elevations)
 
                     rest_stops.append(
-                        RestStop(
+                        (RestStop(
                             start_time=anchor.time,
                             end_time=end_point.time,
                             duration_s=duration_s,
                             latitude=avg_lat,
                             longitude=avg_lon,
                             elevation_m=avg_ele,
-                        )
+                        ), i, end_idx)
                     )
 
             i = max(i + 1, end_idx + 1)
 
         return rest_stops
+
+    def find_track_rest_stops_indexed(
+        self,
+        track_segments: list[list[TrackPoint]] | None = None,
+        radius_m: float = DEFAULT_REST_RADIUS_M,
+        min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+        endpoint_distance_multiplier: float = DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+    ) -> list[tuple[int, RestStop, int, int]]:
+        """Find segment stops, excluding endpoint-near first and last stops."""
+        if endpoint_distance_multiplier <= 0:
+            raise ValueError("endpoint_distance_multiplier must be > 0")
+
+        segments = track_segments if track_segments is not None else self.get_track_point_segments()
+        non_empty = [index for index, segment in enumerate(segments) if segment]
+        if not non_empty:
+            return []
+        first_segment = non_empty[0]
+        last_segment = non_empty[-1]
+        stops: list[tuple[int, RestStop, int, int]] = []
+
+        for segment_index, segment in enumerate(segments):
+            if len(segment) < 2:
+                continue
+            deltas: list[float | None] = []
+            for first, second in zip(segment, segment[1:]):
+                if first.time is None or second.time is None:
+                    deltas.append(None)
+                    continue
+                try:
+                    deltas.append((second.time - first.time).total_seconds())
+                except (TypeError, OverflowError):
+                    deltas.append(None)
+            descending = bool(deltas) and all(delta is not None and delta <= 0 for delta in deltas) and any(
+                delta is not None and delta < 0 for delta in deltas
+            )
+            search_points = list(reversed(segment)) if descending else segment
+            indexed = self.find_rest_stops_indexed(
+                search_points, radius_m=radius_m, min_duration_s=min_duration_s
+            )
+            for stop, search_start, search_end in indexed:
+                if descending:
+                    start_index = len(segment) - 1 - search_end
+                    end_index = len(segment) - 1 - search_start
+                else:
+                    start_index = search_start
+                    end_index = search_end
+                stops.append((segment_index, stop, start_index, end_index))
+
+        stops.sort(key=lambda result: (result[0], result[2]))
+        minimum_endpoint_distance_m = radius_m * endpoint_distance_multiplier
+        start_point = segments[first_segment][0]
+        while stops and self._haversine_distance_m(
+            start_point.latitude,
+            start_point.longitude,
+            stops[0][1].latitude,
+            stops[0][1].longitude,
+        ) < minimum_endpoint_distance_m:
+            stops.pop(0)
+
+        end_point = segments[last_segment][-1]
+        while stops and self._haversine_distance_m(
+            end_point.latitude,
+            end_point.longitude,
+            stops[-1][1].latitude,
+            stops[-1][1].longitude,
+        ) < minimum_endpoint_distance_m:
+            stops.pop()
+        return stops
+
+    def find_track_rest_stops(
+        self,
+        track_segments: list[list[TrackPoint]] | None = None,
+        radius_m: float = DEFAULT_REST_RADIUS_M,
+        min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+        endpoint_distance_multiplier: float = DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+    ) -> list[RestStop]:
+        return [
+            stop
+            for _, stop, _, _ in self.find_track_rest_stops_indexed(
+                track_segments,
+                radius_m=radius_m,
+                min_duration_s=min_duration_s,
+                endpoint_distance_multiplier=endpoint_distance_multiplier,
+            )
+        ]
 
     def get_ride_stats_pretty(
         self,

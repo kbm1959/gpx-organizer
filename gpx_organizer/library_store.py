@@ -16,10 +16,16 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 import xml.etree.ElementTree as ET
 
-from gpx_analyzer import GPXAnalyzer
+from gpx_analyzer import (
+    DEFAULT_REST_MIN_DURATION_S,
+    DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+    DEFAULT_REST_RADIUS_M,
+    GPXAnalyzer,
+)
+from .track_analysis import analyze_track_segments, is_valid_track_analysis
 
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -55,6 +61,8 @@ class TrackRecord:
     file_size: int
     duplicate_of_track_id: int | None
     entry_kind: str = "track"
+    distance_m: float | None = None
+    point_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -325,7 +333,7 @@ class LibraryStore:
             rows = conn.execute(
                 """
                 SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
-                           file_hash, file_size, duplicate_of_track_id, entry_kind
+                           file_hash, file_size, duplicate_of_track_id, entry_kind, metadata_json
                 FROM tracks
                 WHERE folder_id = ?
                 ORDER BY display_name COLLATE NOCASE
@@ -347,7 +355,7 @@ class LibraryStore:
                     JOIN folder_tree ft ON f.parent_id = ft.id
                 )
                 SELECT id, folder_id, display_name, managed_rel_path, original_source_path,
-                           file_hash, file_size, duplicate_of_track_id, entry_kind
+                           file_hash, file_size, duplicate_of_track_id, entry_kind, metadata_json
                 FROM tracks
                 WHERE folder_id IN (SELECT id FROM folder_tree)
                 ORDER BY display_name COLLATE NOCASE
@@ -355,6 +363,90 @@ class LibraryStore:
                 (folder_id,),
             ).fetchall()
         return [_track_record_from_row(row) for row in rows]
+
+    def get_track_analyses(
+        self,
+        track_ids: list[int],
+        progress: Callable[[int, int], None] | None = None,
+        rest_radius_m: float = DEFAULT_REST_RADIUS_M,
+        rest_min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+        rest_endpoint_distance_multiplier: float = DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Load persisted properties, backfilling outdated track metadata as needed."""
+        analyses: list[dict[str, Any]] = []
+        failures: list[str] = []
+        pending: list[tuple[str, int, str, str]] = []
+        conn = self._connect()
+
+        def flush() -> None:
+            if pending:
+                conn.executemany(
+                    "UPDATE tracks SET metadata_json = ? WHERE id = ? AND file_hash = ? AND managed_rel_path = ?",
+                    pending,
+                )
+                conn.commit()
+                pending.clear()
+
+        try:
+            for index, track_id in enumerate(track_ids):
+                if progress is not None:
+                    progress(index, len(track_ids))
+                row = conn.execute(
+                    "SELECT id, entry_kind, display_name, managed_rel_path, file_hash, metadata_json FROM tracks WHERE id = ?",
+                    (track_id,),
+                ).fetchone()
+                if row is None:
+                    failures.append(f"Track {track_id} is no longer available")
+                    continue
+                if row["entry_kind"] != "track":
+                    continue
+                path = self.library_root / str(row["managed_rel_path"])
+                try:
+                    stat = path.stat()
+                    try:
+                        metadata = json.loads(row["metadata_json"] or "{}")
+                    except (ValueError, TypeError):
+                        metadata = {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    analysis = metadata.get("track_analysis")
+                    if (
+                        not is_valid_track_analysis(
+                            analysis,
+                            rest_radius_m,
+                            rest_min_duration_s,
+                            rest_endpoint_distance_multiplier,
+                        )
+                        or metadata.get("analysis_file_mtime_ns") != stat.st_mtime_ns
+                        or metadata.get("analysis_file_size") != stat.st_size
+                    ):
+                        metadata.update(json.loads(
+                            _extract_basic_metadata(
+                                path,
+                                rest_radius_m,
+                                rest_min_duration_s,
+                                rest_endpoint_distance_multiplier,
+                            )
+                        ))
+                        updated = json.dumps(metadata, sort_keys=True)
+                        stat_after = path.stat()
+                        if (stat.st_mtime_ns, stat.st_size) != (stat_after.st_mtime_ns, stat_after.st_size):
+                            raise ValueError("File changed while analyzing")
+                        analysis = metadata["track_analysis"]
+                        pending.append((updated, track_id, str(row["file_hash"]), str(row["managed_rel_path"])))
+                        if len(pending) >= 32:
+                            flush()
+                    analyses.append(analysis)
+                except Exception as exc:
+                    failures.append(f"{row['display_name']}: {exc}")
+            if progress is not None:
+                progress(len(track_ids), len(track_ids))
+            return analyses, failures
+        finally:
+            try:
+                flush()
+            finally:
+                conn.close()
 
     def get_track(self, track_id: int) -> TrackRecord:
         """Return a single track row by id."""
@@ -384,7 +476,39 @@ class LibraryStore:
 
     def create_tray(self, name: str, parent_id: int) -> int:
         """Create a tray under a folder and return its id."""
-        return self._create_folder_or_tray(name, parent_id, is_tray=True)
+        return self.create_trays([name], parent_id)[0]
+
+    def create_trays(self, names: list[str], parent_id: int) -> list[int]:
+        """Create multiple sibling trays atomically and return their ids."""
+        if not names:
+            return []
+
+        cleaned_names = [_clean_folder_name(name) for name in names]
+        normalized_names = [name.casefold() for name in cleaned_names]
+        if len(set(normalized_names)) != len(normalized_names):
+            raise ValueError("Tray names must be unique")
+
+        now = _utc_now_iso()
+        tray_ids: list[int] = []
+        with self._connect() as conn:
+            self._require_folder_destination(conn, parent_id)
+            for name in cleaned_names:
+                if self._sibling_name_exists(conn, parent_id=parent_id, name=name, is_tray=True):
+                    raise ValueError(f"A tray named '{name}' already exists in this location")
+
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM folders WHERE parent_id = ?",
+                (parent_id,),
+            ).fetchone()
+            next_position = int(row["next_pos"])
+            for offset, name in enumerate(cleaned_names):
+                conn.execute(
+                    """INSERT INTO folders(parent_id, name, kind, is_tray, position, created_at, updated_at)
+                       VALUES (?, ?, 'normal', 1, ?, ?, ?)""",
+                    (parent_id, name, next_position + offset, now, now),
+                )
+                tray_ids.append(int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]))
+        return tray_ids
 
     def _create_folder_or_tray(self, name: str, parent_id: int, is_tray: bool) -> int:
         cleaned = _clean_folder_name(name)
@@ -1648,6 +1772,25 @@ def _track_record_from_row(row: sqlite3.Row) -> TrackRecord:
     if "entry_kind" in row.keys() and row["entry_kind"] is not None:
         entry_kind = str(row["entry_kind"])
 
+    distance_m = None
+    point_count = None
+    if "metadata_json" in row.keys() and row["metadata_json"]:
+        try:
+            metadata = json.loads(row["metadata_json"])
+            analysis = metadata.get("track_analysis", {}) if isinstance(metadata, dict) else {}
+            distance = analysis.get("distance_m") if isinstance(analysis, dict) else None
+            points = analysis.get("point_count") if isinstance(analysis, dict) else None
+            if distance is None and isinstance(metadata, dict):
+                distance = float(metadata["total_distance_km"]) * 1000 if metadata.get("total_distance_km") is not None else None
+            if points is None and isinstance(metadata, dict):
+                points = metadata.get("track_points")
+            if isinstance(distance, (int, float)):
+                distance_m = float(distance)
+            if isinstance(points, int):
+                point_count = points
+        except (ValueError, TypeError, KeyError):
+            pass
+
     return TrackRecord(
         id=int(row["id"]),
         folder_id=int(row["folder_id"]),
@@ -1662,6 +1805,8 @@ def _track_record_from_row(row: sqlite3.Row) -> TrackRecord:
             else None
         ),
         entry_kind=entry_kind,
+        distance_m=distance_m,
+        point_count=point_count,
     )
 
 
@@ -1759,10 +1904,16 @@ def _build_copy_folder_name(conn: sqlite3.Connection, parent_id: int, source_nam
         copy_number += 1
 
 
-def _extract_basic_metadata(gpx_path: Path) -> str:
+def _extract_basic_metadata(
+    gpx_path: Path,
+    rest_radius_m: float = DEFAULT_REST_RADIUS_M,
+    rest_min_duration_s: float = DEFAULT_REST_MIN_DURATION_S,
+    rest_endpoint_distance_multiplier: float = DEFAULT_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+) -> str:
     analyzer = GPXAnalyzer()
     analyzer.read_gpx_file(gpx_path)
-    points = analyzer.get_track_points()
+    segments = analyzer.get_track_point_segments()
+    points = [point for segment in segments for point in segment]
     stats = analyzer.get_ride_stats_pretty(track_points=points)
 
     start_time = points[0].time.isoformat() if points and points[0].time is not None else None
@@ -1776,6 +1927,14 @@ def _extract_basic_metadata(gpx_path: Path) -> str:
         "start_time": start_time,
         "end_time": end_time,
         "display_color": _read_gpx_display_color(gpx_path),
+        "track_analysis": analyze_track_segments(
+            segments,
+            rest_radius_m=rest_radius_m,
+            rest_min_duration_s=rest_min_duration_s,
+            rest_endpoint_distance_multiplier=rest_endpoint_distance_multiplier,
+        ),
+        "analysis_file_mtime_ns": gpx_path.stat().st_mtime_ns,
+        "analysis_file_size": gpx_path.stat().st_size,
     }
     return json.dumps(metadata, sort_keys=True)
 

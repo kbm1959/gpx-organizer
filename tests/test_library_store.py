@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import os
 import sqlite3
 
 import pytest
 
 from gpx_analyzer import GPXAnalyzer
 from gpx_organizer.library_store import LibraryStore
+from gpx_organizer import library_store
 
 
 SAMPLE_GPX = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -133,6 +136,24 @@ def test_tray_storage_rules_and_copy(tmp_path: Path) -> None:
     assert len(store.list_tracks_recursive(copied)) == 1
 
 
+def test_create_trays_batch_is_atomic(tmp_path: Path) -> None:
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    root = store.get_root_folder_id()
+    tray_ids = store.create_trays(["Morning", "Evening", "Weekend"], root)
+    trays = [store.get_folder(tray_id) for tray_id in tray_ids]
+    assert [tray.name for tray in trays] == ["Morning", "Evening", "Weekend"]
+    assert all(tray.kind == "tray" and tray.parent_id == root for tray in trays)
+
+    with pytest.raises(ValueError, match="unique"):
+        store.create_trays(["New", "new"], root)
+    with pytest.raises(ValueError, match="already exists"):
+        store.create_trays(["Temporary", "Morning"], root)
+    sibling_names = [folder.name for folder in store.list_folders() if folder.parent_id == root]
+    assert "Temporary" not in sibling_names
+    assert sibling_names.count("Morning") == 1
+
+
 def test_folder_and_tray_names_are_unique_per_type(tmp_path: Path) -> None:
     store = LibraryStore(tmp_path / "library")
     store.initialize()
@@ -209,6 +230,74 @@ def test_preview_cache_flushes_after_interrupted_build(tmp_path: Path) -> None:
             raise RuntimeError("interrupted")
     with store.preview_data_cache() as cache:
         assert cache.get(track.track_id, track.managed_path) == payload
+
+
+def test_track_analysis_backfill_persists_and_refreshes(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "ride.gpx"
+    _write_sample(source)
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    item = store.import_gpx(source, _default_tray(store))
+    with store._connect() as conn:
+        conn.execute("UPDATE tracks SET metadata_json = ? WHERE id = ?", ('{"old": true}', item.track_id))
+    extract = library_store._extract_basic_metadata
+    calls: list[Path] = []
+
+    def counting_extract(path, *args, **kwargs):
+        calls.append(path)
+        return extract(path, *args, **kwargs)
+
+    monkeypatch.setattr(library_store, "_extract_basic_metadata", counting_extract)
+    stats, failures = store.get_track_analyses([item.track_id])
+    assert not failures and len(calls) == 1 and stats[0]["point_count"] == 2
+    reopened = LibraryStore(store.library_root)
+    assert reopened.get_track_analyses([item.track_id])[0] == stats
+    assert len(calls) == 1
+    with store._connect() as conn:
+        metadata = json.loads(conn.execute("SELECT metadata_json FROM tracks WHERE id = ?", (item.track_id,)).fetchone()[0])
+        assert metadata["track_analysis"]["point_count"] == 2
+        assert metadata["old"] is True
+        del metadata["track_analysis"]["distance_m"]
+        conn.execute("UPDATE tracks SET metadata_json = ? WHERE id = ?", (json.dumps(metadata), item.track_id))
+    assert reopened.get_track_analyses([item.track_id])[0] == stats
+    assert len(calls) == 2
+
+    configured, failures = reopened.get_track_analyses(
+        [item.track_id], rest_radius_m=5.0, rest_min_duration_s=120.0
+    )
+    assert not failures and len(calls) == 3
+    assert configured[0]["rest_radius_m"] == 5.0
+    assert configured[0]["rest_min_duration_s"] == 120.0
+    endpoint_configured, failures = reopened.get_track_analyses(
+        [item.track_id], rest_radius_m=5.0, rest_min_duration_s=120.0,
+        rest_endpoint_distance_multiplier=5.0,
+    )
+    assert not failures and len(calls) == 4
+    assert endpoint_configured[0]["rest_endpoint_distance_multiplier"] == 5.0
+
+    old_mtime = item.managed_path.stat().st_mtime_ns
+    item.managed_path.write_text(SAMPLE_GPX.replace("48.101000", "48.201000"), encoding="utf-8")
+    os.utime(item.managed_path, ns=(old_mtime + 1_000_000, old_mtime + 1_000_000))
+    changed, failures = reopened.get_track_analyses(
+        [item.track_id], rest_radius_m=5.0, rest_min_duration_s=120.0,
+        rest_endpoint_distance_multiplier=5.0,
+    )
+    assert not failures and len(calls) == 5
+    assert changed[0]["distance_m"] > stats[0]["distance_m"]
+
+
+def test_track_analysis_does_not_join_gpx_segments(tmp_path: Path) -> None:
+    source = tmp_path / "segments.gpx"
+    source.write_text(
+        SAMPLE_GPX.replace("</trk>", '<trkseg><trkpt lat="49" lon="8"/></trkseg></trk>'),
+        encoding="utf-8",
+    )
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    item = store.import_gpx(source, _default_tray(store))
+    stats, failures = store.get_track_analyses([item.track_id])
+    assert not failures and stats[0]["point_count"] == 3
+    assert stats[0]["distance_m"] < 200
 
 
 def test_preview_cache_rejects_stale_write_after_edit_or_purge(tmp_path: Path) -> None:

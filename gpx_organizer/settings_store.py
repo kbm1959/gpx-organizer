@@ -7,10 +7,12 @@ from pathlib import Path
 import re
 
 from .config import get_app_paths
+from .time_utils import DEFAULT_TIME_ZONE, normalize_time_zone
 
 
 DEFAULT_SETTINGS = {
     "library_root": "",
+    "time_zone": DEFAULT_TIME_ZONE,
     "map_responsive_threshold_px": "900",
     "map_rest_stop_color": "#AB47BC",
     "map_rest_stop_size_px": "6",
@@ -35,6 +37,10 @@ DEFAULT_SETTINGS = {
     "window_keep_folder_tree_structure": "1",
     "window_keep_last_track_shown": "1",
     "window_tracks_first_then_waypoints": "0",
+    "window_min_distance_per_track_point_m": "2.0",
+    "track_rest_radius_m": "2.0",
+    "track_rest_min_duration_s": "60",
+    "track_rest_endpoint_distance_multiplier": "10",
     "window_drag_preview_opacity_percent": "90",
     "window_import_progress_min_gpx_files": "10",
     "window_subfolder_separator_color": "#6E6E6E",
@@ -88,6 +94,18 @@ DEFAULT_WINDOW_KEEP_CONFIGURATION = True
 DEFAULT_WINDOW_KEEP_FOLDER_TREE_STRUCTURE = True
 DEFAULT_WINDOW_KEEP_LAST_TRACK_SHOWN = True
 DEFAULT_WINDOW_TRACKS_FIRST_THEN_WAYPOINTS = False
+DEFAULT_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M = 2.0
+MIN_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M = 0.0
+MAX_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M = 1000.0
+DEFAULT_TRACK_REST_RADIUS_M = 2.0
+MIN_TRACK_REST_RADIUS_M = 0.1
+MAX_TRACK_REST_RADIUS_M = 1000.0
+DEFAULT_TRACK_REST_MIN_DURATION_S = 60.0
+MIN_TRACK_REST_MIN_DURATION_S = 1.0
+MAX_TRACK_REST_MIN_DURATION_S = 86400.0
+DEFAULT_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER = 10.0
+MIN_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER = 1.0
+MAX_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER = 1000.0
 DEFAULT_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 90
 MIN_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 10
 MAX_WINDOW_DRAG_PREVIEW_OPACITY_PERCENT = 100
@@ -153,6 +171,18 @@ def set_library_root(root: Path) -> Path:
     settings["library_root"] = str(resolved)
     save_settings(settings)
     return resolved
+
+
+def get_time_zone() -> str:
+    return normalize_time_zone(load_settings().get("time_zone", DEFAULT_TIME_ZONE))
+
+
+def set_time_zone(value: str) -> str:
+    time_zone = normalize_time_zone(value)
+    settings = load_settings()
+    settings["time_zone"] = time_zone
+    save_settings(settings)
+    return time_zone
 
 
 def get_map_responsive_threshold_px() -> int:
@@ -594,6 +624,106 @@ def set_window_tracks_first_then_waypoints_enabled(enabled: bool) -> bool:
     settings["window_tracks_first_then_waypoints"] = "1" if value else "0"
     save_settings(settings)
     return value
+
+
+def get_window_min_distance_per_track_point_m() -> float:
+    settings = load_settings()
+    try:
+        value = float(settings.get("window_min_distance_per_track_point_m", ""))
+    except ValueError:
+        value = DEFAULT_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M
+    return max(0.0, min(1000.0, value))
+
+
+def set_window_min_distance_per_track_point_m(value: float) -> float:
+    normalized = max(0.0, min(1000.0, float(value)))
+    settings = load_settings()
+    settings["window_min_distance_per_track_point_m"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_track_rest_radius_m() -> float:
+    settings = load_settings()
+    try:
+        value = float(settings.get("track_rest_radius_m", ""))
+    except ValueError:
+        value = DEFAULT_TRACK_REST_RADIUS_M
+    return max(MIN_TRACK_REST_RADIUS_M, min(MAX_TRACK_REST_RADIUS_M, value))
+
+
+def set_track_rest_radius_m(value: float) -> float:
+    normalized = max(MIN_TRACK_REST_RADIUS_M, min(MAX_TRACK_REST_RADIUS_M, float(value)))
+    settings = load_settings()
+    settings["track_rest_radius_m"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_track_rest_min_duration_s() -> float:
+    settings = load_settings()
+    try:
+        value = float(settings.get("track_rest_min_duration_s", ""))
+    except ValueError:
+        value = DEFAULT_TRACK_REST_MIN_DURATION_S
+    return max(MIN_TRACK_REST_MIN_DURATION_S, min(MAX_TRACK_REST_MIN_DURATION_S, value))
+
+
+def set_track_rest_min_duration_s(value: float) -> float:
+    normalized = max(
+        MIN_TRACK_REST_MIN_DURATION_S,
+        min(MAX_TRACK_REST_MIN_DURATION_S, float(value)),
+    )
+    settings = load_settings()
+    settings["track_rest_min_duration_s"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_track_rest_endpoint_distance_multiplier() -> float:
+    settings = load_settings()
+    try:
+        value = float(settings.get("track_rest_endpoint_distance_multiplier", ""))
+    except ValueError:
+        value = DEFAULT_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER
+    return max(
+        MIN_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+        min(MAX_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER, value),
+    )
+
+
+def set_track_rest_endpoint_distance_multiplier(value: float) -> float:
+    normalized = max(
+        MIN_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER,
+        min(MAX_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER, float(value)),
+    )
+    settings = load_settings()
+    settings["track_rest_endpoint_distance_multiplier"] = str(normalized)
+    save_settings(settings)
+    return normalized
+
+
+def get_window_min_distance_per_track_point_m() -> float:
+    settings = load_settings()
+    try:
+        value = float(settings.get("window_min_distance_per_track_point_m", ""))
+    except ValueError:
+        value = DEFAULT_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M
+    return max(
+        MIN_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M,
+        min(MAX_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M, value),
+    )
+
+
+def set_window_min_distance_per_track_point_m(value: float) -> float:
+    normalized = max(
+        MIN_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M,
+        min(MAX_WINDOW_MIN_DISTANCE_PER_TRACK_POINT_M, float(value)),
+    )
+    settings = load_settings()
+    settings["window_min_distance_per_track_point_m"] = str(normalized)
+    save_settings(settings)
+    return normalized
 
 
 def get_window_drag_preview_opacity_percent() -> int:

@@ -224,6 +224,113 @@ def test_tray_ui_and_folder_tree_import(tmp_path: Path, monkeypatch) -> None:
     os.environ.get("DISPLAY") is None and os.environ.get("QT_QPA_PLATFORM") is None,
     reason="No display available for Qt smoke test",
 )
+def test_create_multiple_trays_dialog(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.library_store import LibraryStore
+    from gpx_organizer import main_window
+    from gpx_organizer.qt_compat import QApplication, QDialog, QLineEdit, QSpinBox
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(main_window, "QWebEngineView", None)
+    monkeypatch.setattr(main_window.webbrowser, "open", lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    root = store.get_root_folder_id()
+    window = main_window.MainWindow(store)
+    window._load_library_tree(selected_folder_id=root)
+    created_names = ["Road rides", "Gravel rides", "Weekend rides"]
+
+    def accept_names(dialog):
+        count_spin = dialog.findChild(QSpinBox)
+        assert count_spin is not None and count_spin.value() == 1
+        fields = dialog.findChildren(QLineEdit, "trayNameInput")
+        assert len(fields) == 1 and fields[0].text() == ""
+        fields[0].setText("Road rides")
+        count_spin.setValue(3)
+        fields = dialog.findChildren(QLineEdit, "trayNameInput")
+        assert len(fields) == 3
+        assert [field.text() for field in fields] == ["Road rides", "", ""]
+        for field, name in zip(fields, created_names):
+            field.setText(name)
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(QDialog, "exec", accept_names)
+    window._create_tray_dialog()
+    created = sorted(
+        (folder for folder in store.list_folders() if folder.name in created_names),
+        key=lambda folder: folder.position,
+    )
+    assert [folder.name for folder in created] == created_names
+    assert all(folder.kind == "tray" and folder.parent_id == root for folder in created)
+    assert window._selected_folder_id() == created[0].id
+    assert "Created 3 tray(s)" in window.statusBar().currentMessage()
+    window.close()
+    app.processEvents()
+
+
+@pytest.mark.skipif(
+    os.environ.get("DISPLAY") is None and os.environ.get("QT_QPA_PLATFORM") is None,
+    reason="No display available for Qt smoke test",
+)
+def test_low_distance_per_point_tracks_are_highlighted(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.library_store import LibraryStore
+    from gpx_organizer import main_window
+    from gpx_organizer.qt_compat import QApplication, QColor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(main_window, "QWebEngineView", None)
+    monkeypatch.setattr(main_window.webbrowser, "open", lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    tray = store.create_tray("Tracks", store.get_root_folder_id())
+    short_source = tmp_path / "short.gpx"
+    short_points = "".join(
+        f'<trkpt lat="{48 + index * 0.000001:.6f}" lon="7"><ele>100</ele></trkpt>'
+        for index in range(5)
+    )
+    short_source.write_text(
+        f'<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>{short_points}</trkseg></trk></gpx>',
+        encoding="utf-8",
+    )
+    short_track = store.import_gpx(short_source, tray)
+    normal_source = tmp_path / "normal.gpx"
+    normal_source.write_text(
+        '<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>'
+        '<trkpt lat="48" lon="7"/><trkpt lat="48.01" lon="7"/>'
+        '</trkseg></trk></gpx>', encoding="utf-8"
+    )
+    normal_track = store.import_gpx(normal_source, tray)
+    waypoint_source = tmp_path / "waypoint.gpx"
+    waypoint_source.write_text(
+        '<gpx xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="48" lon="7"/></gpx>',
+        encoding="utf-8",
+    )
+    waypoint = store.import_gpx(waypoint_source, tray)
+
+    window = main_window.MainWindow(store)
+    window._load_library_tree(selected_folder_id=tray)
+    items = {
+        int(window.track_list.item(index).data(main_window.TRACK_ID_ROLE)): window.track_list.item(index)
+        for index in range(window.track_list.count())
+        if window.track_list.item(index).data(main_window.TRACK_ID_ROLE) is not None
+    }
+    flagged = items[short_track.track_id]
+    assert flagged.font().bold()
+    assert flagged.foreground().color() == QColor("#c62828")
+    assert "m/track point" in flagged.toolTip()
+    flagged.setSelected(True)
+    assert flagged.foreground().color() == QColor("#c62828")
+    assert not items[normal_track.track_id].font().bold()
+    assert not items[waypoint.track_id].font().bold()
+    window.close()
+    app.processEvents()
+
+
+@pytest.mark.skipif(
+    os.environ.get("DISPLAY") is None and os.environ.get("QT_QPA_PLATFORM") is None,
+    reason="No display available for Qt smoke test",
+)
 def test_svg_icons_render_and_prefer_vector(tmp_path: Path, monkeypatch) -> None:
     from gpx_organizer.library_store import LibraryStore
     from gpx_organizer import main_window
@@ -265,6 +372,214 @@ def test_svg_icons_render_and_prefer_vector(tmp_path: Path, monkeypatch) -> None
         patch.setattr(main_window.shutil, "which", lambda name: None)
         fallback = window._load_icon_candidate(icon_dir, ["tray.svg", "tray.png"])
         assert fallback is not None and not fallback.pixmap(16, 16).isNull()
+    window.close()
+    app.processEvents()
+
+
+@pytest.mark.skipif(
+    os.environ.get("DISPLAY") is None and os.environ.get("QT_QPA_PLATFORM") is None,
+    reason="No display available for Qt smoke test",
+)
+def test_track_analysis_follows_list_and_selection(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.library_store import LibraryStore
+    from gpx_organizer import main_window
+    from gpx_organizer.qt_compat import QApplication, QDialog, Qt
+    from gpx_organizer.settings_store import (
+        get_time_zone,
+        get_track_rest_endpoint_distance_multiplier,
+        get_track_rest_min_duration_s,
+        get_track_rest_radius_m,
+    )
+    from gpx_organizer.track_analysis import summarize_tracks
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(main_window, "QWebEngineView", None)
+    monkeypatch.setattr(main_window.webbrowser, "open", lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    store = LibraryStore(tmp_path / "library")
+    store.initialize()
+    folder = store.create_folder("Trips", store.get_root_folder_id())
+    tray = store.create_tray("Tracks", folder)
+    empty = store.create_tray("Empty", folder)
+    source = tmp_path / "track.gpx"
+    source.write_text(
+        '<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>'
+        '<trkpt lat="48" lon="7"><ele>100</ele><time>2026-01-01T10:00:00Z</time></trkpt>'
+        '<trkpt lat="48.001" lon="7.001"><ele>110</ele><time>2026-01-01T10:01:00Z</time></trkpt>'
+        '</trkseg></trk></gpx>', encoding="utf-8"
+    )
+    first = store.import_gpx(source, tray)
+    source.write_text(
+        source.read_text(encoding="utf-8").replace(
+            '</trkseg>',
+            '<trkpt lat="48.002" lon="7.002"><ele>105</ele><time>2026-01-01T10:02:00Z</time></trkpt></trkseg>',
+        ), encoding="utf-8"
+    )
+    second = store.import_gpx(source, tray)
+    waypoint_path = tmp_path / "waypoint.gpx"
+    waypoint_path.write_text(
+        '<gpx xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="48" lon="7"/></gpx>', encoding="utf-8"
+    )
+    waypoint = store.import_gpx(waypoint_path, tray)
+    window = main_window.MainWindow(store)
+    window._preview_folder_track_list_enabled = False
+    menus = {
+        action.text(): action.menu()
+        for action in window.menuBar().actions()
+    }
+    assert menus["Edit"].actions()[-1].text() == "Preferences..."
+    assert all(action.text() != "Preferences..." for action in menus["View"].actions())
+    window._load_library_tree(selected_folder_id=tray)
+
+    def wait_for_analysis() -> None:
+        deadline = monotonic() + 10
+        while (window._analysis_update_timer.isActive() or window._analysis_worker_active) and monotonic() < deadline:
+            app.processEvents()
+            Event().wait(0.005)
+        assert not window._analysis_update_timer.isActive()
+        assert not window._analysis_worker_active
+
+    wait_for_analysis()
+    assert [window._analysis_tabs.tabText(index) for index in range(4)] == ["Properties", "Comments", "Links", "Graph"]
+    assert window._analysis_scope_label.text() == "All listed tracks: 2"
+    assert window._analysis_values["point_count"].text() == "5 pts"
+    assert window._analysis_values["start_time"].text() == "2026-01-01\n11:00:00\nCET (UTC+01:00)"
+    assert window._analysis_values["end_time"].text() == "2026-01-01\n11:02:00\nCET (UTC+01:00)"
+    assert window._analysis_values["elapsed_s"].text() == "00:03:00 h:m:s"
+    assert float(window._analysis_values["distance_m"].text().split()[0]) > 0
+    assert float(window._analysis_values["max_uphill_percent"].text().split()[0]) > 0
+    assert float(window._analysis_values["max_downhill_percent"].text().split()[0]) < 0
+    analyses, failures = store.get_track_analyses([first.track_id, second.track_id])
+    assert not failures
+    summary = summarize_tracks(analyses)
+    for key in ("distance_m", "area_km2", "average_speed_kmh", "moving_average_speed_kmh", "min_speed_kmh", "max_speed_kmh"):
+        value = summary[key] / 1000 if key == "distance_m" else summary[key]
+        assert window._analysis_values[key].text() == f"{value:.1f} {window._analysis_units[key]}"
+    for key in ("min_elevation_m", "max_elevation_m", "ascent_m", "descent_m", "max_uphill_percent", "max_downhill_percent"):
+        assert window._analysis_values[key].text() == f"{round(summary[key])} {window._analysis_units[key]}"
+    properties = window._analysis_values["point_count"].parentWidget()
+    grid = properties.layout().itemAt(0).layout()
+    window.resize(1400, 840)
+    window.show()
+    app.processEvents()
+    for index in range(grid.count()):
+        widget = grid.itemAt(index).widget()
+        if widget is not None and widget.hasHeightForWidth():
+            assert widget.height() >= widget.heightForWidth(widget.width())
+    for key, unit in {
+        "point_count": "pts", "distance_m": "km", "area_km2": "km\u00b2",
+        "start_time": "", "elapsed_s": "h:m:s", "rest_count": "rests",
+        "average_speed_kmh": "km/h", "min_elevation_m": "m", "max_uphill_percent": "%",
+    }.items():
+        index = grid.indexOf(window._analysis_values[key])
+        row, column, _, _ = grid.getItemPosition(index)
+        assert column == 1
+        assert window._analysis_values[key].alignment() & Qt.AlignmentFlag.AlignLeft
+        assert window._analysis_units[key] == unit
+        if unit:
+            assert window._analysis_values[key].text().endswith(f" {unit}")
+
+    items = {
+        int(window.track_list.item(index).data(main_window.TRACK_ID_ROLE)): window.track_list.item(index)
+        for index in range(window.track_list.count())
+        if window.track_list.item(index).data(main_window.TRACK_ID_ROLE) is not None
+    }
+    window.track_list.setCurrentItem(items[first.track_id])
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "Selected tracks: 1"
+    assert window._analysis_values["point_count"].text() == "2 pts"
+    assert window._analysis_values["end_time"].text() == "2026-01-01\n11:01:00\nCET (UTC+01:00)"
+    items[second.track_id].setSelected(True)
+    items[waypoint.track_id].setSelected(True)
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "Selected tracks: 2"
+    assert window._analysis_values["point_count"].text() == "5 pts"
+    window.track_list.clearSelection()
+    window.track_list.setCurrentItem(items[waypoint.track_id])
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "No tracks selected"
+    assert window._analysis_values["point_count"].text() == "\u2014"
+    window.track_list.clearSelection()
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "All listed tracks: 2"
+
+    started = Event()
+    release = Event()
+    load_analyses = store.get_track_analyses
+
+    def delayed_analysis(
+        track_ids,
+        progress=None,
+        rest_radius_m=2.0,
+        rest_min_duration_s=60.0,
+        rest_endpoint_distance_multiplier=10.0,
+    ):
+        if track_ids == [first.track_id]:
+            started.set()
+            release.wait(5)
+        return load_analyses(
+            track_ids,
+            progress=progress,
+            rest_radius_m=rest_radius_m,
+            rest_min_duration_s=rest_min_duration_s,
+            rest_endpoint_distance_multiplier=rest_endpoint_distance_multiplier,
+        )
+
+    monkeypatch.setattr(store, "get_track_analyses", delayed_analysis)
+    window.track_list.setCurrentItem(items[first.track_id])
+    deadline = monotonic() + 5
+    while not started.is_set() and monotonic() < deadline:
+        app.processEvents()
+        Event().wait(0.005)
+    assert started.is_set()
+    window.track_list.setCurrentItem(items[second.track_id])
+    release.set()
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "Selected tracks: 1"
+    assert window._analysis_values["point_count"].text() == "3 pts"
+
+    def accept_timezone(dialog):
+        assert dialog.selected_time_zone() == "Europe/Berlin"
+        dialog._time_zone_combo.setCurrentText("UTC")
+        assert dialog.selected_rest_stop_radius_m() == 2.0
+        assert dialog.selected_rest_stop_min_duration_s() == 60.0
+        assert dialog.selected_rest_stop_endpoint_distance_multiplier() == 10.0
+        dialog._rest_stop_radius_spin.setValue(5.0)
+        dialog._rest_stop_min_duration_spin.setValue(120)
+        dialog._rest_stop_endpoint_distance_multiplier_spin.setValue(5.0)
+        return int(QDialog.DialogCode.Accepted)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(main_window.PreferencesDialog, "exec", accept_timezone)
+        window._open_preferences_dialog()
+    wait_for_analysis()
+    assert get_time_zone() == "UTC"
+    assert get_track_rest_radius_m() == 5.0
+    assert get_track_rest_min_duration_s() == 120.0
+    assert get_track_rest_endpoint_distance_multiplier() == 5.0
+    assert window.map_service.rest_stop_radius_m == 5.0
+    assert window.map_service.rest_stop_min_duration_s == 120.0
+    assert window.map_service.rest_stop_endpoint_distance_multiplier == 5.0
+    assert window._analysis_values["start_time"].text() == "2026-01-01\n10:00:00\nUTC (UTC+00:00)"
+    assert window.map_service.time_zone == "UTC"
+    map_payload = window.map_service._build_track_payload(second.managed_path, "Track")
+    assert map_payload["startTimeDisplay"] == window._analysis_values["start_time"].text().replace("\n", " ")
+    assert all(
+        stop["durationMin"] >= 2.0
+        for stop in map_payload["restStops"]
+    )
+    saved_analyses, failures = store.get_track_analyses(
+        [second.track_id], rest_radius_m=5.0, rest_min_duration_s=120.0,
+        rest_endpoint_distance_multiplier=5.0,
+    )
+    assert not failures
+    assert saved_analyses[0]["rest_radius_m"] == 5.0
+    assert saved_analyses[0]["rest_min_duration_s"] == 120.0
+    assert saved_analyses[0]["rest_endpoint_distance_multiplier"] == 5.0
+
+    window._load_library_tree(selected_folder_id=empty)
+    wait_for_analysis()
+    assert window._analysis_scope_label.text() == "No tracks in this view"
     window.close()
     app.processEvents()
 

@@ -12,6 +12,7 @@ from threading import Event, Thread
 from typing import Callable
 from urllib.parse import parse_qs
 import webbrowser
+from zoneinfo import available_timezones
 
 from .qt_compat import (
     QApplication,
@@ -45,6 +46,7 @@ from .qt_compat import (
     QPixmap,
     QProgressDialog,
     QProgressBar,
+    QScrollArea,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -66,7 +68,13 @@ from .qt_compat import (
 from .config import APP_NAME, get_app_paths
 from .library_store import FolderRecord, LibraryStore, TrackRecord
 from .map_service import LeafletMapService, MapService
+from .track_analysis import summarize_tracks
+from .time_utils import format_track_time
 from .settings_store import (
+    get_track_rest_endpoint_distance_multiplier,
+    get_track_rest_min_duration_s,
+    get_track_rest_radius_m,
+    get_time_zone,
     get_map_default_track_color,
     get_map_direction_arrow_count,
     get_map_direction_arrow_color,
@@ -92,6 +100,7 @@ from .settings_store import (
     get_window_keep_configuration_enabled,
     get_window_keep_folder_tree_structure_enabled,
     get_window_keep_last_track_shown_enabled,
+    get_window_min_distance_per_track_point_m,
     get_window_subfolder_separator_color,
     get_window_subfolder_separator_opacity_percent,
     get_window_library_splitter_sizes,
@@ -102,8 +111,9 @@ from .settings_store import (
     get_window_size,
     get_window_splitter_sizes,
     set_map_default_track_color,
-    set_map_direction_arrow_count,
+    set_time_zone,
     set_map_direction_arrow_color,
+    set_map_direction_arrow_count,
     set_map_direction_arrow_size_px,
     set_map_distance_marker_border_color,
     set_map_distance_marker_color,
@@ -121,12 +131,16 @@ from .settings_store import (
     set_map_stop_symbol_size_px,
     set_map_track_point_color,
     set_map_track_point_size_px,
+    set_track_rest_min_duration_s,
+    set_track_rest_radius_m,
+    set_track_rest_endpoint_distance_multiplier,
     set_window_folder_tree_expanded_ids,
     set_window_drag_preview_opacity_percent,
     set_window_import_progress_min_gpx_files,
     set_window_keep_configuration_enabled,
     set_window_keep_folder_tree_structure_enabled,
     set_window_keep_last_track_shown_enabled,
+    set_window_min_distance_per_track_point_m,
     set_window_subfolder_separator_color,
     set_window_subfolder_separator_opacity_percent,
     set_window_library_splitter_sizes,
@@ -170,6 +184,15 @@ class _FolderPreviewCacheEntry:
 class _FolderPreviewSignals(QObject):
     progress = Signal(int, int, int)
     completed = Signal(int, int, object, int, str)
+
+
+class _AnalysisSignals(QObject):
+    progress = Signal(int, int, int)
+    completed = Signal(int, object, object, str)
+
+
+class _AnalysisCancelled(Exception):
+    pass
 
 
 class _PreviewCancelled(Exception):
@@ -680,6 +703,7 @@ class PreferencesDialog(QDialog):
     def __init__(
         self,
         library_root_path: str,
+        time_zone: str,
         drag_preview_opacity_percent: int,
         import_progress_min_gpx_files: int,
         subfolder_separator_color: str,
@@ -708,6 +732,10 @@ class PreferencesDialog(QDialog):
         direction_arrow_size_px: int,
         track_point_color: str,
         track_point_size_px: int,
+        min_distance_per_track_point_m: float,
+        rest_stop_radius_m: float,
+        rest_stop_min_duration_s: float,
+        rest_stop_endpoint_distance_multiplier: float,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -729,6 +757,12 @@ class PreferencesDialog(QDialog):
         library_layout.addWidget(self._library_root_path_edit)
         library_layout.addWidget(browse_button)
         general_form.addRow("Track Library Path:", library_row)
+
+        self._time_zone_combo = QComboBox(general_tab)
+        self._time_zone_combo.addItems(sorted(available_timezones() | {"UTC", "Europe/Berlin", time_zone}))
+        self._time_zone_combo.setCurrentText(time_zone)
+        self._time_zone_combo.setMaxVisibleItems(20)
+        general_form.addRow("Time zone:", self._time_zone_combo)
 
         self._drag_preview_opacity_spin = QSpinBox(general_tab)
         self._drag_preview_opacity_spin.setRange(10, 100)
@@ -823,6 +857,14 @@ class PreferencesDialog(QDialog):
 
         add_section_header("Track", shaded=False)
 
+        self._min_distance_per_track_point_spin = QDoubleSpinBox(track_tab)
+        self._min_distance_per_track_point_spin.setRange(0.0, 1000.0)
+        self._min_distance_per_track_point_spin.setDecimals(1)
+        self._min_distance_per_track_point_spin.setSingleStep(0.1)
+        self._min_distance_per_track_point_spin.setSuffix(" m/track point")
+        self._min_distance_per_track_point_spin.setValue(min_distance_per_track_point_m)
+        form.addRow("Highlight tracks below:", self._min_distance_per_track_point_spin)
+
         self._default_track_color_button = QPushButton(default_track_color, track_tab)
         self._default_track_color_button.clicked.connect(
             lambda: self._pick_color(self._default_track_color_button)
@@ -893,6 +935,31 @@ class PreferencesDialog(QDialog):
         form.addRow("Distance marker size:", self._distance_marker_size_spin)
 
         add_section_header("Rest Stop", shaded=False)
+
+        self._rest_stop_radius_spin = QDoubleSpinBox(track_tab)
+        self._rest_stop_radius_spin.setRange(0.1, 1000.0)
+        self._rest_stop_radius_spin.setDecimals(1)
+        self._rest_stop_radius_spin.setSingleStep(0.1)
+        self._rest_stop_radius_spin.setSuffix(" m")
+        self._rest_stop_radius_spin.setValue(rest_stop_radius_m)
+        form.addRow("Rest radius:", self._rest_stop_radius_spin)
+
+        self._rest_stop_min_duration_spin = QSpinBox(track_tab)
+        self._rest_stop_min_duration_spin.setRange(1, 86400)
+        self._rest_stop_min_duration_spin.setSingleStep(1)
+        self._rest_stop_min_duration_spin.setSuffix(" s")
+        self._rest_stop_min_duration_spin.setValue(round(rest_stop_min_duration_s))
+        form.addRow("Minimum rest duration:", self._rest_stop_min_duration_spin)
+
+        self._rest_stop_endpoint_distance_multiplier_spin = QDoubleSpinBox(track_tab)
+        self._rest_stop_endpoint_distance_multiplier_spin.setRange(1.0, 1000.0)
+        self._rest_stop_endpoint_distance_multiplier_spin.setDecimals(1)
+        self._rest_stop_endpoint_distance_multiplier_spin.setSingleStep(1.0)
+        self._rest_stop_endpoint_distance_multiplier_spin.setSuffix(" × rest radius")
+        self._rest_stop_endpoint_distance_multiplier_spin.setValue(
+            rest_stop_endpoint_distance_multiplier
+        )
+        form.addRow("Minimum distance from track endpoints:", self._rest_stop_endpoint_distance_multiplier_spin)
 
         self._rest_stop_color_button = QPushButton(rest_stop_color, track_tab)
         self._rest_stop_color_button.clicked.connect(
@@ -988,6 +1055,9 @@ class PreferencesDialog(QDialog):
     def selected_library_root_path(self) -> Path:
         return Path(self._library_root_path_edit.text().strip()).expanduser()
 
+    def selected_time_zone(self) -> str:
+        return self._time_zone_combo.currentText()
+
     def selected_map_threshold_px(self) -> int:
         return int(self._map_threshold_spin.value())
 
@@ -1072,6 +1142,18 @@ class PreferencesDialog(QDialog):
     def selected_track_point_size_px(self) -> int:
         return int(self._track_point_size_spin.value())
 
+    def selected_min_distance_per_track_point_m(self) -> float:
+        return float(self._min_distance_per_track_point_spin.value())
+
+    def selected_rest_stop_radius_m(self) -> float:
+        return float(self._rest_stop_radius_spin.value())
+
+    def selected_rest_stop_min_duration_s(self) -> float:
+        return float(self._rest_stop_min_duration_spin.value())
+
+    def selected_rest_stop_endpoint_distance_multiplier(self) -> float:
+        return float(self._rest_stop_endpoint_distance_multiplier_spin.value())
+
     def _browse_library_root_path(self) -> None:
         selected_dir = QFileDialog.getExistingDirectory(
             self,
@@ -1154,6 +1236,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.library_store = library_store
         self.map_service = map_service or LeafletMapService()
+        self._time_zone = get_time_zone()
+        if isinstance(self.map_service, LeafletMapService):
+            self.map_service.time_zone = self._time_zone
         self.library_tree: FolderTreeWidget | None = None
         self.track_list: TrackListWidget | None = None
         self.map_web_view: QWebEngineView | None = None
@@ -1176,6 +1261,17 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[_EditCommand] = []
         self._redo_stack: list[_EditCommand] = []
         self._visible_tracks: list[TrackRecord] = []
+        self._analysis_values: dict[str, QLabel] = {}
+        self._analysis_units: dict[str, str] = {}
+        self._analysis_revision = 0
+        self._analysis_worker_active = False
+        self._analysis_cancel = Event()
+        self._analysis_signals = _AnalysisSignals()
+        self._analysis_signals.progress.connect(self._analysis_progress)
+        self._analysis_signals.completed.connect(self._analysis_completed)
+        self._analysis_update_timer = QTimer(self)
+        self._analysis_update_timer.setSingleShot(True)
+        self._analysis_update_timer.timeout.connect(self._start_analysis_update)
         self._preview_cache: dict[int, _FolderPreviewCacheEntry] = {}
         self._preview_cache_queue: set[int] = set()
         self._preview_revision = 0
@@ -1214,6 +1310,10 @@ class MainWindow(QMainWindow):
         self._tracks_first_then_waypoints_enabled = (
             get_window_tracks_first_then_waypoints_enabled()
         )
+        self._min_distance_per_track_point_m = get_window_min_distance_per_track_point_m()
+        self._rest_stop_radius_m = get_track_rest_radius_m()
+        self._rest_stop_min_duration_s = get_track_rest_min_duration_s()
+        self._rest_stop_endpoint_distance_multiplier = get_track_rest_endpoint_distance_multiplier()
         self._last_track_id_to_restore: int | None = (
             get_window_last_track_id() if self._keep_last_track_shown_enabled else None
         )
@@ -1302,6 +1402,9 @@ class MainWindow(QMainWindow):
         self._redo_action = edit_menu.addAction("Redo")
         self._redo_action.setShortcut("Ctrl+Y")
         self._redo_action.triggered.connect(self._redo_last_edit)
+        edit_menu.addSeparator()
+        preferences_action = edit_menu.addAction("Preferences...")
+        preferences_action.triggered.connect(self._open_preferences_dialog)
 
         track_menu = menu_bar.addMenu("Track")
         trim_action = track_menu.addAction("Trim")
@@ -1319,9 +1422,6 @@ class MainWindow(QMainWindow):
         refresh_map_action.triggered.connect(self._refresh_map_view)
         fit_map_action = view_menu.addAction("Fit Track")
         fit_map_action.triggered.connect(self._fit_track_in_view)
-        preferences_action = view_menu.addAction("Preferences...")
-        preferences_action.triggered.connect(self._open_preferences_dialog)
-
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self._show_about)
@@ -1404,7 +1504,7 @@ class MainWindow(QMainWindow):
         tracks_title.setObjectName("panelSubTitle")
 
         track_list = TrackListWidget(container)
-        track_list.setStyleSheet("QListWidget::item:selected { background: #d3e6f4; color: #172f42; }")
+        track_list.setStyleSheet("QListWidget::item:selected { background: #d3e6f4; }")
         track_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         track_list.setDragEnabled(True)
         track_list.setAcceptDrops(False)
@@ -1448,27 +1548,186 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        title = QLabel("Tracks & Waypoints", container)
+        title = QLabel("Track & Waypoint Analysis", container)
         title.setObjectName("panelTitle")
-
-        summary = QLabel(
-            "Reserved for Milestone 7: track analysis and metadata view.",
-            container,
-        )
-        summary.setWordWrap(True)
-
-        details = QLabel(
-            "This panel will host per-track statistics, metadata, and analysis outputs.",
-            container,
-        )
-        details.setWordWrap(True)
-        details.setStyleSheet("QLabel { color: #4d4d4d; }")
-
         layout.addWidget(title)
-        layout.addWidget(summary)
-        layout.addWidget(details)
-        layout.addStretch(1)
+        self._analysis_scope_label = QLabel("No tracks", container)
+        self._analysis_scope_label.setWordWrap(True)
+        layout.addWidget(self._analysis_scope_label)
+
+        tabs = QTabWidget(container)
+        tabs.setStyleSheet("QTabBar::tab { padding: 4px 5px; }")
+        self._analysis_tabs = tabs
+        scroll = QScrollArea(tabs)
+        scroll.setWidgetResizable(True)
+        properties = QWidget(scroll)
+        properties_layout = QVBoxLayout(properties)
+        properties_layout.setContentsMargins(8, 8, 8, 8)
+        sections = (
+            ("Overview", (("Track points", "point_count", "pts"), ("Distance", "distance_m", "km"), ("Bounding area", "area_km2", "km\u00b2"))),
+            ("Time", (("Start", "start_time", ""), ("End", "end_time", ""), ("Elapsed", "elapsed_s", "h:m:s"), ("While driving", "moving_time_s", "h:m:s"), ("Rests", "rest_count", "rests"), ("Rest time", "rest_time_s", "h:m:s"))),
+            ("Speed", (("Average", "average_speed_kmh", "km/h"), ("Average while driving", "moving_average_speed_kmh", "km/h"), ("Minimum", "min_speed_kmh", "km/h"), ("Maximum", "max_speed_kmh", "km/h"))),
+            ("Elevation", (("Minimum", "min_elevation_m", "m"), ("Maximum", "max_elevation_m", "m"), ("Increase", "ascent_m", "m"), ("Decrease", "descent_m", "m"), ("Maximum uphill", "max_uphill_percent", "%"), ("Maximum downhill", "max_downhill_percent", "%"))),
+        )
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setColumnStretch(0, 1)
+        row = 0
+        for section_index, (heading, fields) in enumerate(sections):
+            heading_label = QLabel(heading, properties)
+            heading_label.setStyleSheet("color: #173f67; font-weight: bold;")
+            if section_index > 0:
+                heading_label.setContentsMargins(0, 10, 0, 0)
+            grid.addWidget(heading_label, row, 0, 1, 2)
+            row += 1
+            divider = QWidget(properties)
+            divider.setFixedHeight(3)
+            divider.setStyleSheet("background-color: #a9bacb;")
+            grid.addWidget(divider, row, 0, 1, 2)
+            row += 1
+            for label, key, unit in fields:
+                description = QLabel(label, properties)
+                description.setWordWrap(True)
+                value = QLabel("\u2014", properties)
+                value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                value.setWordWrap(True)
+                self._analysis_values[key] = value
+                self._analysis_units[key] = unit
+                grid.addWidget(description, row, 0)
+                grid.addWidget(value, row, 1)
+                row += 1
+        properties_layout.addLayout(grid)
+        self._analysis_values["area_km2"].setToolTip("Spherical rectangle enclosing all included track points.")
+        self._analysis_values["elapsed_s"].setToolTip("Sum of elapsed times within GPX segments.")
+        for key in ("start_time", "end_time"):
+            self._analysis_values[key].setToolTip(
+                "Track endpoint time in the configured time zone; for multiple tracks, the earliest and latest endpoint times."
+            )
+        for key in ("rest_count", "rest_time_s", "moving_time_s", "moving_average_speed_kmh"):
+            self._analysis_values[key].setToolTip("Rests stay within 2 m for at least 60 seconds.")
+        for key in ("max_uphill_percent", "max_downhill_percent"):
+            self._analysis_values[key].setToolTip(
+                "Extremes of the same sampled segments shown in the track map's grade tooltips."
+            )
+        properties_layout.addStretch(1)
+        scroll.setWidget(properties)
+        tabs.addTab(scroll, "Properties")
+        for name in ("Comments", "Links", "Graph"):
+            page = QWidget(tabs)
+            page_layout = QVBoxLayout(page)
+            page_layout.addWidget(QLabel("Not available yet", page))
+            page_layout.addStretch(1)
+            tabs.addTab(page, name)
+        layout.addWidget(tabs)
         return container
+
+    def _schedule_analysis_update(self) -> None:
+        self._analysis_revision += 1
+        self._analysis_cancel.set()
+        for label in self._analysis_values.values():
+            label.setText("\u2014")
+        if hasattr(self, "_analysis_scope_label"):
+            self._analysis_scope_label.setText("Preparing track analysis...")
+            self._analysis_scope_label.setToolTip("")
+        self._analysis_update_timer.start(80)
+
+    def _start_analysis_update(self) -> None:
+        if self._analysis_worker_active:
+            return
+        selected_ids = set(self._selected_track_ids())
+        tracks = [
+            track.id for track in self._visible_tracks
+            if track.entry_kind == "track" and (not selected_ids or track.id in selected_ids)
+        ]
+        for label in self._analysis_values.values():
+            label.setText("\u2014")
+        scope = "Selected tracks" if selected_ids else "All listed tracks"
+        if not tracks:
+            self._analysis_scope_label.setText("No tracks selected" if selected_ids else "No tracks in this view")
+            return
+
+        revision = self._analysis_revision
+        cancel = Event()
+        self._analysis_cancel = cancel
+        self._analysis_worker_active = True
+        self._analysis_scope_label.setText(f"{scope}: {len(tracks)} | Analyzing 0/{len(tracks)}")
+        signals = self._analysis_signals
+        store = self.library_store
+        rest_radius_m = self._rest_stop_radius_m
+        rest_min_duration_s = self._rest_stop_min_duration_s
+        rest_endpoint_distance_multiplier = self._rest_stop_endpoint_distance_multiplier
+
+        def progress(completed: int, total: int) -> None:
+            if cancel.is_set():
+                raise _AnalysisCancelled()
+            if completed == total or completed % 16 == 0:
+                signals.progress.emit(revision, completed, total)
+
+        def build() -> None:
+            analyses: list[dict] = []
+            failures: list[str] = []
+            error = ""
+            try:
+                analyses, failures = store.get_track_analyses(
+                    tracks,
+                    progress=progress,
+                    rest_radius_m=rest_radius_m,
+                    rest_min_duration_s=rest_min_duration_s,
+                    rest_endpoint_distance_multiplier=rest_endpoint_distance_multiplier,
+                )
+            except _AnalysisCancelled:
+                error = "cancelled"
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            try:
+                signals.completed.emit(revision, analyses, failures, error)
+            except RuntimeError:
+                pass
+
+        Thread(target=build, daemon=True).start()
+
+    def _analysis_progress(self, revision: int, completed: int, total: int) -> None:
+        if revision != self._analysis_revision:
+            return
+        scope = "Selected tracks" if self._selected_track_ids() else "All listed tracks"
+        self._analysis_scope_label.setText(f"{scope}: {total} | Analyzing {completed}/{total}")
+
+    def _analysis_completed(self, revision: int, analyses, failures, error: str) -> None:
+        self._analysis_worker_active = False
+        if revision != self._analysis_revision or error == "cancelled":
+            self._analysis_update_timer.start(0)
+            return
+        if error:
+            self._analysis_scope_label.setText(f"Analysis failed: {error}")
+            return
+        summary = summarize_tracks(analyses)
+        scope = "Selected tracks" if self._selected_track_ids() else "All listed tracks"
+        text = f"{scope}: {len(analyses)}"
+        if failures:
+            text += f" | {len(failures)} unavailable"
+        self._analysis_scope_label.setText(text)
+        self._analysis_scope_label.setToolTip("\n".join(failures))
+        for key, label in self._analysis_values.items():
+            value = summary.get(key)
+            if value is None:
+                text = "\u2014"
+            elif key in {"start_time", "end_time"}:
+                timestamp = format_track_time(value, self._time_zone)
+                text = "\n".join(timestamp.split(" ", 2)) if timestamp else "\u2014"
+            elif key in {"elapsed_s", "moving_time_s", "rest_time_s"}:
+                hours, remainder = divmod(int(round(value)), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            elif key in {"point_count", "rest_count"}:
+                text = str(int(value))
+            elif key in {"min_elevation_m", "max_elevation_m", "ascent_m", "descent_m", "max_uphill_percent", "max_downhill_percent"}:
+                text = str(round(value))
+            else:
+                text = f"{value / 1000 if key == 'distance_m' else value:.1f}"
+            if value is not None and self._analysis_units[key]:
+                text += f" {self._analysis_units[key]}"
+            label.setText(text)
 
     def _load_ui_icons(self) -> None:
         style = self.style()
@@ -2191,6 +2450,7 @@ class MainWindow(QMainWindow):
         if folder_kind == "root":
             self._visible_tracks = []
             self._update_track_list_counts([])
+            self._schedule_analysis_update()
             self.track_list.blockSignals(True)
             self.track_list.clear()
             placeholder = QListWidgetItem("Select a subfolder to view tracks and waypoints")
@@ -2232,6 +2492,7 @@ class MainWindow(QMainWindow):
             placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.track_list.addItem(placeholder)
             self.track_list.blockSignals(False)
+            self._schedule_analysis_update()
             self._set_map_placeholder(
                 title="Map Preview",
                 message="No tracks or waypoints in this folder view.",
@@ -2249,6 +2510,21 @@ class MainWindow(QMainWindow):
                 item.setIcon(self._waypoint_item_icon)
             else:
                 item.setIcon(self._track_item_icon)
+                if (
+                    track.distance_m is not None
+                    and track.point_count is not None
+                    and track.point_count > 0
+                ):
+                    distance_per_point = track.distance_m / track.point_count
+                    if distance_per_point < self._min_distance_per_track_point_m:
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        item.setForeground(QColor("#c62828"))
+                        item.setToolTip(
+                            f"{distance_per_point:.2f} m/track point; "
+                            f"below {self._min_distance_per_track_point_m:.1f} m/track point"
+                        )
             self.track_list.addItem(item)
             if selected_track_id is not None and track.id == selected_track_id:
                 self.track_list.setCurrentItem(item)
@@ -2268,6 +2544,7 @@ class MainWindow(QMainWindow):
                 add_track_item(track)
 
         self.track_list.blockSignals(False)
+        self._schedule_analysis_update()
 
         # For folder navigation, keep list selection empty so map preview reflects
         # the folder overview rather than a stale/implicit item selection.
@@ -2297,6 +2574,7 @@ class MainWindow(QMainWindow):
         )
 
     def _schedule_preview_update(self) -> None:
+        self._schedule_analysis_update()
         if self._selected_track_ids():
             self._preview_cancel.set()
             self._preview_cache_queue.discard(self._selected_folder_id())
@@ -3327,6 +3605,7 @@ class MainWindow(QMainWindow):
     def _open_preferences_dialog(self) -> None:
         dialog = PreferencesDialog(
             library_root_path=str(self.library_store.library_root),
+            time_zone=self._time_zone,
             drag_preview_opacity_percent=get_window_drag_preview_opacity_percent(),
             import_progress_min_gpx_files=get_window_import_progress_min_gpx_files(),
             subfolder_separator_color=get_window_subfolder_separator_color(),
@@ -3341,6 +3620,10 @@ class MainWindow(QMainWindow):
             rest_stop_color=get_map_rest_stop_color(),
             rest_stop_size_px=get_map_rest_stop_size_px(),
             default_track_color=get_map_default_track_color(),
+            min_distance_per_track_point_m=self._min_distance_per_track_point_m,
+            rest_stop_radius_m=self._rest_stop_radius_m,
+            rest_stop_min_duration_s=self._rest_stop_min_duration_s,
+            rest_stop_endpoint_distance_multiplier=self._rest_stop_endpoint_distance_multiplier,
             start_symbol_color=get_map_start_symbol_color(),
             start_symbol_size_px=get_map_start_symbol_size_px(),
             start_symbol_shape=get_map_start_symbol_shape(),
@@ -3378,6 +3661,7 @@ class MainWindow(QMainWindow):
                     "Track Library Path must point to an existing library (contains library.db).",
                 )
 
+        self._time_zone = set_time_zone(dialog.selected_time_zone())
         saved_threshold = set_map_responsive_threshold_px(dialog.selected_map_threshold_px())
         self._preview_folder_track_list_enabled = set_window_preview_folder_track_list_enabled(
             dialog.selected_preview_folder_track_list_enabled()
@@ -3413,6 +3697,16 @@ class MainWindow(QMainWindow):
         self._tracks_first_then_waypoints_enabled = set_window_tracks_first_then_waypoints_enabled(
             dialog.selected_tracks_first_then_waypoints_enabled()
         )
+        self._min_distance_per_track_point_m = set_window_min_distance_per_track_point_m(
+            dialog.selected_min_distance_per_track_point_m()
+        )
+        self._rest_stop_radius_m = set_track_rest_radius_m(dialog.selected_rest_stop_radius_m())
+        self._rest_stop_min_duration_s = set_track_rest_min_duration_s(
+            dialog.selected_rest_stop_min_duration_s()
+        )
+        self._rest_stop_endpoint_distance_multiplier = set_track_rest_endpoint_distance_multiplier(
+            dialog.selected_rest_stop_endpoint_distance_multiplier()
+        )
         saved_rest_stop_color = set_map_rest_stop_color(dialog.selected_rest_stop_color())
         saved_rest_stop_size_px = set_map_rest_stop_size_px(dialog.selected_rest_stop_size_px())
         saved_default_track_color = set_map_default_track_color(dialog.selected_default_track_color())
@@ -3444,6 +3738,12 @@ class MainWindow(QMainWindow):
         saved_track_point_size_px = set_map_track_point_size_px(dialog.selected_track_point_size_px())
 
         if isinstance(self.map_service, LeafletMapService):
+            self.map_service.time_zone = self._time_zone
+            self.map_service.rest_stop_radius_m = self._rest_stop_radius_m
+            self.map_service.rest_stop_min_duration_s = self._rest_stop_min_duration_s
+            self.map_service.rest_stop_endpoint_distance_multiplier = (
+                self._rest_stop_endpoint_distance_multiplier
+            )
             self.map_service.responsive_threshold_px = saved_threshold
             self.map_service.rest_stop_color = saved_rest_stop_color
             self.map_service.rest_stop_size_px = saved_rest_stop_size_px
@@ -4205,7 +4505,69 @@ class MainWindow(QMainWindow):
         self._create_tree_node_dialog(is_tray=False)
 
     def _create_tray_dialog(self) -> None:
-        self._create_tree_node_dialog(is_tray=True)
+        if self._selected_folder_kind() not in {"root", "normal"}:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("New Trays")
+        dialog.resize(420, 260)
+        dialog_layout = QVBoxLayout(dialog)
+        count_row = QWidget(dialog)
+        count_layout = QHBoxLayout(count_row)
+        count_layout.setContentsMargins(0, 0, 0, 0)
+        count_layout.addWidget(QLabel("Number of trays:", count_row))
+        count_spin = QSpinBox(count_row)
+        count_spin.setRange(1, 1000)
+        count_spin.setValue(1)
+        count_layout.addWidget(count_spin)
+        count_layout.addStretch(1)
+        dialog_layout.addWidget(count_row)
+
+        names_scroll = QScrollArea(dialog)
+        names_scroll.setWidgetResizable(True)
+        names_widget = QWidget(names_scroll)
+        form = QFormLayout(names_widget)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        name_fields: list[QLineEdit] = []
+        names_scroll.setWidget(names_widget)
+        dialog_layout.addWidget(names_scroll, 1)
+
+        def resize_name_fields(count: int) -> None:
+            previous_names = [field.text() for field in name_fields]
+            while form.rowCount():
+                form.removeRow(0)
+            name_fields.clear()
+            for index in range(count):
+                name_field = QLineEdit(names_widget)
+                name_field.setObjectName("trayNameInput")
+                if index < len(previous_names):
+                    name_field.setText(previous_names[index])
+                form.addRow(f"Tray {index + 1}:", name_field)
+                name_fields.append(name_field)
+
+        count_spin.valueChanged.connect(resize_name_fields)
+        resize_name_fields(count_spin.value())
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+
+        tray_names = [field.text() for field in name_fields]
+        try:
+            parent_id = self._selected_folder_id()
+            tray_ids = self.library_store.create_trays(tray_names, parent_id)
+            self._load_library_tree(selected_folder_id=tray_ids[0])
+            self._mark_preview_cache_dirty_for_ancestor_chain(parent_id)
+            self.statusBar().showMessage(
+                f"Created {len(tray_ids)} tray(s)", 4000
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Create trays failed", str(exc))
 
     def _create_tree_node_dialog(self, is_tray: bool) -> None:
         if self._selected_folder_kind() not in {"root", "normal"}:
@@ -4471,6 +4833,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # pragma: no cover - GUI behavior
         self._preview_cancel.set()
+        self._analysis_cancel.set()
         if self._keep_window_configuration_enabled:
             set_window_size(self.width(), self.height())
             if self._main_splitter is not None:

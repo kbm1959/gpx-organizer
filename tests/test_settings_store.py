@@ -29,6 +29,60 @@ def test_set_library_root_persists(tmp_path: Path, monkeypatch) -> None:
     assert loaded["library_root"] == str(target.resolve())
 
 
+def test_time_zone_defaults_persists_and_falls_back(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.config import AppPaths
+
+    config_root = tmp_path / "config"
+    monkeypatch.setattr(settings_store, "get_app_paths", lambda: AppPaths(
+        base_dir=config_root, config_file=config_root / "settings.json", log_file=config_root / "app.log"
+    ))
+    assert settings_store.get_time_zone() == "Europe/Berlin"
+    assert settings_store.set_time_zone("America/New_York") == "America/New_York"
+    assert settings_store.get_time_zone() == "America/New_York"
+    assert settings_store.set_time_zone("invalid/timezone") == "Europe/Berlin"
+    assert settings_store.get_time_zone() == "Europe/Berlin"
+
+
+def test_min_distance_per_track_point_threshold_defaults_and_persists(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.config import AppPaths
+
+    config_root = tmp_path / "config"
+    monkeypatch.setattr(settings_store, "get_app_paths", lambda: AppPaths(
+        base_dir=config_root, config_file=config_root / "settings.json", log_file=config_root / "app.log"
+    ))
+    assert settings_store.get_window_min_distance_per_track_point_m() == 2.0
+    assert settings_store.set_window_min_distance_per_track_point_m(3.5) == 3.5
+    assert settings_store.get_window_min_distance_per_track_point_m() == 3.5
+    assert settings_store.set_window_min_distance_per_track_point_m(-1) == 0
+    assert settings_store.get_window_min_distance_per_track_point_m() == 0
+
+
+def test_rest_preferences_default_persist_and_clamp(tmp_path: Path, monkeypatch) -> None:
+    from gpx_organizer.config import AppPaths
+
+    config_root = tmp_path / "config"
+    monkeypatch.setattr(settings_store, "get_app_paths", lambda: AppPaths(
+        base_dir=config_root, config_file=config_root / "settings.json", log_file=config_root / "app.log"
+    ))
+    assert settings_store.get_track_rest_radius_m() == 2.0
+    assert settings_store.get_track_rest_min_duration_s() == 60.0
+    assert settings_store.get_track_rest_endpoint_distance_multiplier() == 10.0
+    assert settings_store.set_track_rest_radius_m(5.5) == 5.5
+    assert settings_store.set_track_rest_min_duration_s(180) == 180
+    assert settings_store.set_track_rest_endpoint_distance_multiplier(7.5) == 7.5
+    assert settings_store.get_track_rest_radius_m() == 5.5
+    assert settings_store.get_track_rest_min_duration_s() == 180
+    assert settings_store.get_track_rest_endpoint_distance_multiplier() == 7.5
+    assert settings_store.set_track_rest_radius_m(0) == settings_store.MIN_TRACK_REST_RADIUS_M
+    assert settings_store.set_track_rest_min_duration_s(90000) == settings_store.MAX_TRACK_REST_MIN_DURATION_S
+    assert settings_store.set_track_rest_endpoint_distance_multiplier(0) == (
+        settings_store.MIN_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER
+    )
+    assert settings_store.set_track_rest_endpoint_distance_multiplier(1001) == (
+        settings_store.MAX_TRACK_REST_ENDPOINT_DISTANCE_MULTIPLIER
+    )
+
+
 def test_set_map_responsive_threshold_persists(tmp_path: Path, monkeypatch) -> None:
     config_root = tmp_path / "config"
 
